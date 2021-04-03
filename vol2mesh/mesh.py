@@ -13,7 +13,7 @@ import lz4.frame
 from vol2mesh.util import compute_nonzero_box, extract_subvol
 
 try:
-    from dvidutils import LabelMapper, encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
+    from dvidutils import LabelMapper, encode_faces_to_drc_bytes, encode_faces_to_custom_drc_bytes, decode_drc_bytes_to_faces
     _dvidutils_available = True
 except ImportError:
     _dvidutils_available = False
@@ -24,6 +24,8 @@ from .obj_utils import write_obj, read_obj
 from .ngmesh import read_ngmesh, write_ngmesh
 from .io_utils import TemporaryNamedPipe, AutoDeleteDir, stdout_redirected
 
+from functools import cmp_to_key
+
 logger = logging.getLogger(__name__)
 
 DRACO_USE_PIPE = False
@@ -32,9 +34,9 @@ class Mesh:
     """
     A class to hold the elements of a mesh.
     """
-    MESH_FORMATS = ('obj', 'drc', 'ngmesh')
+    MESH_FORMATS = ('obj', 'drc', 'custom_drc', 'ngmesh')
     
-    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, pickle_compression_method='lz4'):
+    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, mesh_origin=None, fragment_shape=None, fragment_origin=None, pickle_compression_method='lz4'):
         """
         Args:
             vertices_zyx: ndarray (N,3), float32
@@ -51,9 +53,9 @@ class Mesh:
             
             pickle_compression_method:
                 How (or whether) to compress vertices, normals, and faces during pickling.
-                Choices are: 'draco', 'lz4', or None.
+                Choices are: 'draco','custom_draco', 'lz4', or None.
         """
-        assert pickle_compression_method in (None, 'lz4', 'draco')
+        assert pickle_compression_method in (None, 'lz4', 'draco', 'custom_draco')
         self.pickle_compression_method = pickle_compression_method
         self._destroyed = False
         
@@ -76,6 +78,10 @@ class Mesh:
         for a in (self._vertices_zyx, self._faces, self._normals_zyx):
             assert a.ndim == 2 and a.shape[1] == 3, f"Input array has wrong shape: {a.shape}"
 
+        self.mesh_origin = mesh_origin
+        self.fragment_shape = fragment_shape
+        self.fragment_origin = fragment_origin
+       
         if box is not None:
             self.box = np.asarray(box)
             assert self.box.shape == (2,3) 
@@ -245,7 +251,7 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, method='ilastik', **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, mesh_origin=None, fragment_shape=None, fragment_origin=None, method='ilastik', **kwargs):
         """
         Alternate constructor.
         Run marching cubes on the given volume and return a Mesh object.
@@ -324,7 +330,7 @@ class Mesh:
                     normals_zyx = normals_xyz[:, ::-1]
                     faces[:] = faces[:, ::-1]
 
-                vertices_zyx += 0.5
+                    vertices_zyx += 0.5
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -347,7 +353,7 @@ class Mesh:
         vertices_zyx[:] *= resolution
         vertices_zyx[:] += fullres_box_zyx[0]
         
-        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx)
+        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx, mesh_origin=mesh_origin, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
 
 
     @classmethod
@@ -486,6 +492,8 @@ class Mesh:
             return self.vertices_zyx.nbytes + self.faces.nbytes + self.normals_zyx.nbytes
         elif method == 'draco':
             return self._compress_as_draco()
+        elif method == 'custom_draco':
+            return self._compress_as_custom_draco()
         elif method == 'lz4':
             return self._compress_as_lz4()
         else:
@@ -503,6 +511,16 @@ class Mesh:
             self._faces = None
         return len(self._draco_bytes)
     
+    def _compress_as_custom_draco(self):
+        assert _dvidutils_available, \
+            "Can't use draco compression if dvidutils isn't installed"
+        if self._draco_bytes is None:
+            self._uncompress() # Ensure not currently compressed as lz4
+            self._draco_bytes = encode_faces_to_custom_drc_bytes(self._vertices_zyx[:,::-1], self._normals_zyx[:,::-1], self._faces, self._mesh_origin, self._fragment_shape, self._fragment_origin, position_quantization_bits = 10)
+            self._vertices_zyx = None
+            self._normals_zyx = None
+            self._faces = None
+        return len(self._draco_bytes)
 
     def _compress_as_lz4(self):
         if self._lz4_items is None:
@@ -639,7 +657,35 @@ class Mesh:
     @auto_uncompress
     def normals_zyx(self, new_normals_zyx):
         self._normals_zyx = new_normals_zyx
+
+    @property
+    def mesh_origin(self):
+        return self._mesh_origin
     
+    @mesh_origin.setter
+    def mesh_origin(self, new_mesh_origin):
+        self._mesh_origin = new_mesh_origin
+
+    
+    @property
+    def fragment_shape(self):
+        return self._fragment_shape
+    
+    @fragment_shape.setter
+    def fragment_shape(self, new_fragment_shape):
+        self._fragment_shape = new_fragment_shape
+
+    @property
+    def fragment_origin(self):
+        return self._fragment_origin
+    
+    @fragment_origin.setter
+    def fragment_origin(self, new_fragment_origin):
+        self._fragment_origin = new_fragment_origin
+    
+    @property
+    def draco_bytes(self):
+        return self._draco_bytes
 
     def stitch_adjacent_faces(self, drop_unused_vertices=True, drop_duplicate_faces=True):
         """
@@ -1024,6 +1070,22 @@ class Mesh:
                     f.write(draco_bytes)
             else:
                 return draco_bytes
+        
+        elif fmt == 'custom_drc':
+            assert _dvidutils_available, \
+                "Can't use draco compression if dvidutils isn't installed"
+            draco_bytes = self._draco_bytes
+            if draco_bytes is None:
+                if self.normals_zyx.shape[0] == 0:
+                    self.recompute_normals(True) # See comment in Mesh.compress()
+                draco_bytes = encode_faces_to_custom_drc_bytes(self.vertices_zyx[:,::-1], self.normals_zyx[:,::-1], self.faces, self.mesh_origin, self.fragment_shape, self.fragment_origin)
+            
+            if path:
+                with open(path, 'wb') as f:
+                    f.write(draco_bytes)
+            else:
+                return draco_bytes
+
         elif fmt == 'ngmesh':
             if path:
                 write_ngmesh(self.vertices_zyx[:,::-1], self.faces, path)
@@ -1051,6 +1113,10 @@ class Mesh:
             Mesh
         """
         return concatenate_meshes(meshes, keep_normals)
+
+    @classmethod
+    def concatenate_mesh_bytes(cls, meshes):
+        return concatenate_mesh_bytes(meshes)
 
 
 def concatenate_meshes(meshes, keep_normals=True):
@@ -1105,6 +1171,18 @@ def concatenate_meshes(meshes, keep_normals=True):
 
     return Mesh( concatenated_vertices, concatenated_faces, concatenated_normals, total_box )
 
+def concatenate_mesh_bytes(meshes):
+    
+    if not isinstance(meshes, list):
+        meshes = list(meshes)
+
+    fragment_origins = [ mesh.fragment_origin for mesh in meshes ]
+
+    # Sort in Z-curve order
+    meshes, fragment_origins = zip(*sorted(zip(meshes, fragment_origins), key=cmp_to_key(lambda x, y: _cmp_zorder(x[1], y[1]))))
+
+    return [meshes]
+        
 
 def _verify_concatenate_inputs(meshes, vertex_counts):
     normals_counts = np.fromiter((len(mesh.normals_zyx) for mesh in meshes), np.int64, len(meshes))
@@ -1152,3 +1230,19 @@ def _verify_concatenate_inputs(meshes, vertex_counts):
         msg += f"Wrote first matching mesh to {output_path} (host: {hostname})\n"
     
     raise RuntimeError(msg)
+
+def _cmp_zorder(lhs, rhs) -> bool:
+    def less_msb(x: int, y: int) -> bool:
+        return x < y and x < (x ^ y)
+
+    # Assume lhs and rhs array-like objects of indices.
+    assert len(lhs) == len(rhs)
+    # Will contain the most significant dimension.
+    msd = 2
+    # Loop over the other dimensions.
+    for dim in [1, 0]:
+        # Check if the current dimension is more significant
+        # by comparing the most significant bits.
+        if less_msb(lhs[msd] ^ rhs[msd], lhs[dim] ^ rhs[dim]):
+            msd = dim
+    return lhs[msd] - rhs[msd]

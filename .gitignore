@@ -2,3 +2,4 @@
 .project
 .pydevproject
 __pycache__/
+vol2mesh.egg-info/
