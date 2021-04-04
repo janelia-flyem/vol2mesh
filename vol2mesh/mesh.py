@@ -516,7 +516,7 @@ class Mesh:
             "Can't use draco compression if dvidutils isn't installed"
         if self._draco_bytes is None:
             self._uncompress() # Ensure not currently compressed as lz4
-            self._draco_bytes = encode_faces_to_custom_drc_bytes(self._vertices_zyx[:,::-1], self._normals_zyx[:,::-1], self._faces, self._mesh_origin, self._fragment_shape, self._fragment_origin, position_quantization_bits = 10)
+            self._draco_bytes = encode_faces_to_custom_drc_bytes(self._vertices_zyx[:,::-1], self._normals_zyx[:,::-1], self._faces, self._fragment_shape, self._fragment_origin, position_quantization_bits = 10)
             self._vertices_zyx = None
             self._normals_zyx = None
             self._faces = None
@@ -1115,8 +1115,8 @@ class Mesh:
         return concatenate_meshes(meshes, keep_normals)
 
     @classmethod
-    def concatenate_mesh_bytes(cls, meshes):
-        return concatenate_mesh_bytes(meshes)
+    def concatenate_mesh_bytes(cls, meshes, current_lod, highest_res_lod):
+        return concatenate_mesh_bytes(meshes, current_lod, highest_res_lod)
 
 
 def concatenate_meshes(meshes, keep_normals=True):
@@ -1171,11 +1171,38 @@ def concatenate_meshes(meshes, keep_normals=True):
 
     return Mesh( concatenated_vertices, concatenated_faces, concatenated_normals, total_box )
 
-def concatenate_mesh_bytes(meshes):
+def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
+    def group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod):
+        mesh_origin = meshes[0].mesh_origin
+        brick_shape = meshes[0].fragment_shape
+
+        # default brick size corresponds with highest lod
+        bricks_to_combine = 2**(current_lod - highest_res_lod)
+        current_lod_brick_shape = bricks_to_combine*brick_shape
+
+        combined_mesh_dictionary = {}
+        for mesh in meshes:
+            fragment_origin = mesh.fragment_origin
+            combined_fragment_origin = tuple( mesh_origin + current_lod_brick_shape * ((fragment_origin - mesh_origin) // current_lod_brick_shape) )
+            if combined_fragment_origin in combined_mesh_dictionary:
+                combined_mesh_dictionary[combined_fragment_origin].append(mesh)
+            else:
+                combined_mesh_dictionary[combined_fragment_origin] = [mesh]
+
+        combined_meshes = []
+        for fragment_origin, meshes_to_combine in combined_mesh_dictionary.items():
+            combined_mesh = Mesh.concatenate_meshes(meshes_to_combine, keep_normals=False)
+            combined_mesh.mesh_origin = mesh_origin
+            combined_mesh.fragment_origin = np.array(fragment_origin)
+            combined_mesh.fragment_shape = current_lod_brick_shape
+            combined_meshes.append(combined_mesh)
+        
+        return combined_meshes
     
     if not isinstance(meshes, list):
         meshes = list(meshes)
 
+    meshes = group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod)
     fragment_origins = [ mesh.fragment_origin for mesh in meshes ]
 
     # Sort in Z-curve order
