@@ -25,6 +25,7 @@ from .ngmesh import read_ngmesh, write_ngmesh
 from .io_utils import TemporaryNamedPipe, AutoDeleteDir, stdout_redirected
 
 from functools import cmp_to_key
+import trimesh
 
 logger = logging.getLogger(__name__)
 
@@ -1078,7 +1079,7 @@ class Mesh:
             if draco_bytes is None:
                 if self.normals_zyx.shape[0] == 0:
                     self.recompute_normals(True) # See comment in Mesh.compress()
-                draco_bytes = encode_faces_to_custom_drc_bytes(self.vertices_zyx[:,::-1], self.normals_zyx[:,::-1], self.faces, self.mesh_origin, self.fragment_shape, self.fragment_origin)
+                draco_bytes = encode_faces_to_custom_drc_bytes(self.vertices_zyx[:,::-1], self.normals_zyx[:,::-1], self.faces, self.fragment_shape, self.fragment_origin)
             
             if path:
                 with open(path, 'wb') as f:
@@ -1091,6 +1092,25 @@ class Mesh:
                 write_ngmesh(self.vertices_zyx[:,::-1], self.faces, path)
             else:
                 return write_ngmesh(self.vertices_zyx[:,::-1], self.faces)
+
+    def trim(self):
+        min_box = self.fragment_origin
+        max_box = self.fragment_origin + self.fragment_shape
+        # Define plane normals and create a trimesh object.
+        nyz, nxz, nxy = np.eye(3)
+        verts = self.vertices_zyx[:,::-1]
+        faces = self.faces
+        trimesh_mesh = trimesh.Trimesh(verts,faces)
+        #print(f"before {type(verts)} {type(faces)} {np.amax(verts,axis=0)} {min_box} {max_box} {len(verts)} {faces.shape} {faces.reshape(-1).shape}")
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
+        #verts, faces = trimesh.intersections.slice_faces_plane(verts, faces, plane_normal=nyz, plane_origin=min_box) DIDNT WORK WITH JUST FACES AND VERTS
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
+        self.vertices_zyx = trimesh_mesh.vertices[:,::-1]
+        self.faces = trimesh_mesh.faces
 
 
     @classmethod
@@ -1117,6 +1137,8 @@ class Mesh:
     @classmethod
     def concatenate_mesh_bytes(cls, meshes, current_lod, highest_res_lod):
         return concatenate_mesh_bytes(meshes, current_lod, highest_res_lod)
+
+       
 
 
 def concatenate_meshes(meshes, keep_normals=True):
