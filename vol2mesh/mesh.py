@@ -1096,6 +1096,7 @@ class Mesh:
     def trim(self):
         min_box = self.fragment_origin
         max_box = self.fragment_origin + self.fragment_shape
+        #print(f"boxes: {min_box} {max_box} {self.vertices_zyx.shape} {np.amax(self.vertices_zyx,0)} {np.amin(self.vertices_zyx,0)}")
         # Define plane normals and create a trimesh object.
         nyz, nxz, nxy = np.eye(3)
         verts = self.vertices_zyx[:,::-1]
@@ -1106,11 +1107,14 @@ class Mesh:
         #verts, faces = trimesh.intersections.slice_faces_plane(verts, faces, plane_normal=nyz, plane_origin=min_box) DIDNT WORK WITH JUST FACES AND VERTS
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimeshvol_mesh, plane_normal=-nxz, plane_origin=max_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
-        self.vertices_zyx = trimesh_mesh.vertices[:,::-1]
+        self.vertices_zyx = trimesh_mesh.vertices[:,::-1]#.astype('float32')
         self.faces = trimesh_mesh.faces
+        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                   np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+        #self.recompute_normals() #only necessary if trimming mesh fragments and doing lz4 compression?
 
 
     @classmethod
