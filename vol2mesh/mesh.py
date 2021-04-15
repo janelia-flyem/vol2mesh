@@ -37,7 +37,7 @@ class Mesh:
     """
     MESH_FORMATS = ('obj', 'drc', 'custom_drc', 'ngmesh')
     
-    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, mesh_origin=None, fragment_shape=None, fragment_origin=None, pickle_compression_method='lz4'):
+    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, fragment_shape=None, fragment_origin=None, pickle_compression_method='lz4'):
         """
         Args:
             vertices_zyx: ndarray (N,3), float32
@@ -79,7 +79,6 @@ class Mesh:
         for a in (self._vertices_zyx, self._faces, self._normals_zyx):
             assert a.ndim == 2 and a.shape[1] == 3, f"Input array has wrong shape: {a.shape}"
 
-        self.mesh_origin = mesh_origin
         self.fragment_shape = fragment_shape
         self.fragment_origin = fragment_origin
        
@@ -252,7 +251,7 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, mesh_origin=None, fragment_shape=None, fragment_origin=None, method='ilastik', **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, rescale_level=0, method='ilastik', **kwargs):
         """
         Alternate constructor.
         Run marching cubes on the given volume and return a Mesh object.
@@ -331,7 +330,7 @@ class Mesh:
                     normals_zyx = normals_xyz[:, ::-1]
                     faces[:] = faces[:, ::-1]
 
-                    vertices_zyx += 0.5
+                    vertices_zyx += 0.5/2**rescale_level
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -354,7 +353,7 @@ class Mesh:
         vertices_zyx[:] *= resolution
         vertices_zyx[:] += fullres_box_zyx[0]
         
-        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx, mesh_origin=mesh_origin, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
+        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
 
 
     @classmethod
@@ -658,15 +657,6 @@ class Mesh:
     @auto_uncompress
     def normals_zyx(self, new_normals_zyx):
         self._normals_zyx = new_normals_zyx
-
-    @property
-    def mesh_origin(self):
-        return self._mesh_origin
-    
-    @mesh_origin.setter
-    def mesh_origin(self, new_mesh_origin):
-        self._mesh_origin = new_mesh_origin
-
     
     @property
     def fragment_shape(self):
@@ -1104,7 +1094,7 @@ class Mesh:
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimeshvol_mesh, plane_normal=-nxz, plane_origin=max_box)
+        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
         trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
         self.vertices_zyx = trimesh_mesh.vertices[:,::-1]#.astype('float32')
@@ -1195,7 +1185,6 @@ def concatenate_meshes(meshes, keep_normals=True):
 
 def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
     def group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod):
-        mesh_origin = meshes[0].mesh_origin
         brick_shape = meshes[0].fragment_shape
 
         # default brick size corresponds with highest lod
@@ -1205,7 +1194,7 @@ def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
         combined_mesh_dictionary = {}
         for mesh in meshes:
             fragment_origin = mesh.fragment_origin
-            combined_fragment_origin = tuple( mesh_origin + current_lod_brick_shape * ((fragment_origin - mesh_origin) // current_lod_brick_shape) )
+            combined_fragment_origin = tuple( current_lod_brick_shape * (fragment_origin // current_lod_brick_shape) )
             if combined_fragment_origin in combined_mesh_dictionary:
                 combined_mesh_dictionary[combined_fragment_origin].append(mesh)
             else:
@@ -1214,7 +1203,6 @@ def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
         combined_meshes = []
         for fragment_origin, meshes_to_combine in combined_mesh_dictionary.items():
             combined_mesh = Mesh.concatenate_meshes(meshes_to_combine, keep_normals=False)
-            combined_mesh.mesh_origin = mesh_origin
             combined_mesh.fragment_origin = np.array(fragment_origin)
             combined_mesh.fragment_shape = current_lod_brick_shape
             combined_meshes.append(combined_mesh)
