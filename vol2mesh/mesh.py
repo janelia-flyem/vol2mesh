@@ -1090,17 +1090,28 @@ class Mesh:
         nyz, nxz, nxy = np.eye(3)
         verts = self.vertices_zyx[:,::-1]
         faces = self.faces
+        
         trimesh_mesh = trimesh.Trimesh(verts,faces)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
-        trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
-        self.vertices_zyx = trimesh_mesh.vertices[:,::-1]#.astype('float32')
-        self.faces = trimesh_mesh.faces
-        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
+        if len(trimesh_mesh.vertices)>0:
+            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
+        if len(trimesh_mesh.vertices)>0:
+            self.vertices_zyx = trimesh_mesh.vertices[:,::-1]#.astype('float32')
+            self.faces = trimesh_mesh.faces
+            self.box = np.array( [ self.vertices_zyx.min(axis=0),
                                    np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+        else:
+            self.vertices_zyx=[]
+            self.faces= []
 
 
     @classmethod
@@ -1125,8 +1136,8 @@ class Mesh:
         return concatenate_meshes(meshes, keep_normals)
 
     @classmethod
-    def concatenate_mesh_bytes(cls, meshes, current_lod, highest_res_lod):
-        return concatenate_mesh_bytes(meshes, current_lod, highest_res_lod)
+    def concatenate_mesh_bytes(cls, meshes, vertex_count, current_lod, highest_res_lod):
+        return concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod)
 
        
 
@@ -1183,7 +1194,7 @@ def concatenate_meshes(meshes, keep_normals=True):
 
     return Mesh( concatenated_vertices, concatenated_faces, concatenated_normals, total_box )
 
-def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
+def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
     def group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod):
         brick_shape = meshes[0].fragment_shape
 
@@ -1211,9 +1222,12 @@ def concatenate_mesh_bytes(meshes, current_lod, highest_res_lod):
     
     if not isinstance(meshes, list):
         meshes = list(meshes)
-
+    if not isinstance(vertex_count,list):
+        vertex_count = list(vertex_count)
+    meshes = [mesh for idx,mesh in enumerate(meshes) if vertex_count[idx]>0] # remove 0 sized meshes
     meshes = group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod)
-    fragment_origins = [ mesh.fragment_origin for mesh in meshes ]
+
+    fragment_origins = [ mesh.fragment_origin//meshes[0].fragment_shape for mesh in meshes ] #fragment origin needs to be in this reduced form, eg (0,0,1), for z-curve order
 
     # Sort in Z-curve order
     meshes, fragment_origins = zip(*sorted(zip(meshes, fragment_origins), key=cmp_to_key(lambda x, y: _cmp_zorder(x[1], y[1]))))
