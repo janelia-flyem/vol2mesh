@@ -251,7 +251,7 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, rescale_level=0, method='ilastik', **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, lod=0, method='ilastik', **kwargs):
         """
         Alternate constructor.
         Run marching cubes on the given volume and return a Mesh object.
@@ -330,7 +330,7 @@ class Mesh:
                     normals_zyx = normals_xyz[:, ::-1]
                     faces[:] = faces[:, ::-1]
 
-                    vertices_zyx += 0.5/2**rescale_level
+                    vertices_zyx += 0.5/2**lod
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -343,9 +343,8 @@ class Mesh:
                 # Just return an empty mesh.
                 empty_vertices = np.zeros( (0, 3), dtype=np.float32 )
                 empty_faces = np.zeros( (0, 3), dtype=np.uint32 )
-                return Mesh(empty_vertices, empty_faces, box=fullres_box_zyx)
+                return Mesh(empty_vertices, empty_faces, box=fullres_box_zyx, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
             else:
-                logger.error("Error during mesh generation")
                 raise
     
         
@@ -926,6 +925,20 @@ class Mesh:
         # (Can decimation produce degenerate faces?)
         self.recompute_normals(True)
 
+    def simplify_open3d(self, fraction):
+        import open3d
+        print("get as open3d")
+        as_open3d = open3d.geometry.TriangleMesh(
+            vertices=open3d.utility.Vector3dVector(self.vertices_zyx[:,::-1]),
+            triangles=open3d.utility.Vector3iVector(self.faces))
+        print(f"got as open3d {len(self.faces)} {int(fraction*len(self.faces))}")
+        resulting_faces = int(fraction*len(self.faces))
+        if(resulting_faces>5):
+            simple = as_open3d.simplify_quadric_decimation(resulting_faces, boundary_weight=1E9)
+            print(f"simplified {resulting_faces}, {len(simple.triangles)}")
+            self.faces = np.asarray(simple.triangles).astype(np.uint32)
+            print(f"max {np.amax(np.asarray(simple.vertices)[:,::-1])} {np.amax(self.vertices_zyx)}")
+            self.vertices_zyx = np.asarray(simple.vertices)[:,::-1].astype(np.float32)
 
     def laplacian_smooth(self, iterations=1):
         """
@@ -1082,36 +1095,96 @@ class Mesh:
                 write_ngmesh(self.vertices_zyx[:,::-1], self.faces, path)
             else:
                 return write_ngmesh(self.vertices_zyx[:,::-1], self.faces)
+    
+    def get_partition_point(fragment_shape, fragment_origin, position_quantization_bits):
+        #https://github.com/google/neuroglancer/blob/8432f531c4d8eb421556ec36926a29d9064c2d3c/src/neuroglancer/mesh/draco/neuroglancer_draco.cc#L82-L83
+        scale = (2**position_quantization_bits-1)/fragment_shape
+        offset = 0.5/scale-fragment_origin
+        partition_point_as_int = 2**(position_quantization_bits-1)
 
-    def trim(self):
+        partition_point = partition_point_as_int/scale - offset
+
+        return partition_point
+
+    def trim_subchunks(self,mesh, min_box, max_box, position_quantization_bits):
+        nyz, nxz, nxy = np.eye(3)
+        #fragment_shape = max_box - min_box
+        half_box = (max_box+min_box)/2#*( 2**(position_quantization_bits-1)/1023 )
+
+        #partition_point = self.get_partition_point(fragment_shape, min_box, position_quantization_bits)
+
+        trim_edges = []
+        trim_edges.append(min_box)
+        trim_edges.append(half_box)
+        trim_edges.append(max_box)
+        print(f"why failing {min_box} {max_box} {half_box}")
+        submesh = 0
+        for x in range(2):
+            mesh_x = trimesh.intersections.slice_mesh_plane(mesh, plane_normal=nyz, plane_origin=trim_edges[x])
+            mesh_x = trimesh.intersections.slice_mesh_plane(mesh_x, plane_normal=-nyz, plane_origin=trim_edges[x+1])
+            for y in range(2):
+                mesh_y = trimesh.intersections.slice_mesh_plane(mesh_x, plane_normal=nxz, plane_origin=trim_edges[y])
+                mesh_y = trimesh.intersections.slice_mesh_plane(mesh_y, plane_normal=-nxz, plane_origin=trim_edges[y+1])
+                for z in range(2):
+                    mesh_z = trimesh.intersections.slice_mesh_plane(mesh_y, plane_normal=nxy, plane_origin=trim_edges[z])
+                    mesh_z = trimesh.intersections.slice_mesh_plane(mesh_z, plane_normal=-nxy, plane_origin=trim_edges[z+1])
+                    if len(mesh_z.vertices)>0:
+                        if submesh==0:
+                            all_verts = mesh_z.vertices
+                            all_faces = mesh_z.faces
+                        else:
+                            mesh_z.export(f"/groups/scicompsoft/home/ackermand/Programming/flyemflows/temp_data/realObj/{int(x)}_{int(y)}_{int(z)}.obj")
+                            num_vertices = np.shape(all_verts)[0]
+                            all_verts = np.append(all_verts, mesh_z.vertices, axis=0)
+                            all_faces = np.append(all_faces, mesh_z.faces+num_vertices, axis=0)
+                        submesh+=1
+        temp = trimesh.Trimesh(all_verts, all_faces)
+        temp.export("/groups/scicompsoft/home/ackermand/Programming/flyemflows/temp_data/realObj/total.obj")
+        #check_face_crosses_boundary(all_faces, all_verts.astype('float32'), half_box)
+        self.vertices_zyx = all_verts[:,::-1].astype('float32')
+        self.faces = all_faces
+        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+
+    def trim(self, lod=0, position_quantization_bits=10, do_trim_subchunks=False):           
         min_box = self.fragment_origin
         max_box = self.fragment_origin + self.fragment_shape
 
         nyz, nxz, nxy = np.eye(3)
         verts = self.vertices_zyx[:,::-1]
         faces = self.faces
-        
         trimesh_mesh = trimesh.Trimesh(verts,faces)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
-        if len(trimesh_mesh.vertices)>0:
-            trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
-        if len(trimesh_mesh.vertices)>0:
-            self.vertices_zyx = trimesh_mesh.vertices[:,::-1]#.astype('float32')
-            self.faces = trimesh_mesh.faces
-            self.box = np.array( [ self.vertices_zyx.min(axis=0),
-                                   np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+
+        #the following is necessary because pydraco rounds by adding 0.5/scale, so need to make sure trimming happens at actual appropriate place
+        #upper_bound = 2**position_quantization_bits
+        #scale = upper_bound/(self.fragment_shape[0]*2**lod) # presently mesh vertices aren't readjusted by rescale, so they are eg at 1/4 their "actual position". hence need an extra factor of 2, ie. 2*lod 
+        min_box = min_box#.astype('float64')
+        max_box = max_box#.astype('float64')
+        #print(f"{scale} {self.fragment_shape} {min_box} {max_box}")
+        if do_trim_subchunks:
+            self.trim_subchunks(trimesh_mesh, min_box, max_box, position_quantization_bits)
         else:
-            self.vertices_zyx=[]
-            self.faces= []
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                self.vertices_zyx = trimesh_mesh.vertices[:,::-1].astype('float32')
+                self.faces = trimesh_mesh.faces.astype('uint32')
+                self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                    np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+            else:
+                self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
+                self.normals=np.zeros( (0,3), dtype=np.float32 )
+                self.faces= np.zeros((0,3), np.uint32)
 
 
     @classmethod
@@ -1197,11 +1270,9 @@ def concatenate_meshes(meshes, keep_normals=True):
 def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
     def group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod):
         brick_shape = meshes[0].fragment_shape
-
         # default brick size corresponds with highest lod
         bricks_to_combine = 2**(current_lod - highest_res_lod)
         current_lod_brick_shape = bricks_to_combine*brick_shape
-
         combined_mesh_dictionary = {}
         for mesh in meshes:
             fragment_origin = mesh.fragment_origin
@@ -1224,6 +1295,7 @@ def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
         meshes = list(meshes)
     if not isinstance(vertex_count,list):
         vertex_count = list(vertex_count)
+    
     meshes = [mesh for idx,mesh in enumerate(meshes) if vertex_count[idx]>0] # remove 0 sized meshes
     meshes = group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod)
 
@@ -1297,3 +1369,22 @@ def _cmp_zorder(lhs, rhs) -> bool:
         if less_msb(lhs[msd] ^ rhs[msd], lhs[dim] ^ rhs[dim]):
             msd = dim
     return lhs[msd] - rhs[msd]
+
+def check_face_crosses_boundary(faces, vertices, chunk_size):
+        def edge_crosses_boundary(v1,v2, chunk_size):
+            v1_floored = v1//chunk_size
+            v2_floored = v2//chunk_size
+            if not np.array_equal(v1_floored, v2_floored):
+                for i in range(3):
+                    if v1_floored[i] != v2_floored[i] and np.mod(v1[i], chunk_size[i])!=0 and np.mod(v2[i],chunk_size[i])!=0:
+                        print(f"faillllll {v1} {v2}")
+                        print(f"floooooor {v1_floored} {v2_floored}")
+            return False
+
+        for face in faces:
+            v1 = vertices[face[0]]
+            v2 = vertices[face[1]]
+            v3 = vertices[face[2]]
+            edge_crosses_boundary(v1,v2,chunk_size)
+            edge_crosses_boundary(v1,v3,chunk_size)
+            edge_crosses_boundary(v2,v3,chunk_size)
