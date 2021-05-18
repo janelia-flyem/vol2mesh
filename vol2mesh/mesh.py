@@ -1132,13 +1132,10 @@ class Mesh:
                             all_verts = mesh_z.vertices
                             all_faces = mesh_z.faces
                         else:
-                            mesh_z.export(f"/groups/scicompsoft/home/ackermand/Programming/flyemflows/temp_data/realObj/{int(x)}_{int(y)}_{int(z)}.obj")
                             num_vertices = np.shape(all_verts)[0]
                             all_verts = np.append(all_verts, mesh_z.vertices, axis=0)
                             all_faces = np.append(all_faces, mesh_z.faces+num_vertices, axis=0)
                         submesh+=1
-        temp = trimesh.Trimesh(all_verts, all_faces)
-        temp.export("/groups/scicompsoft/home/ackermand/Programming/flyemflows/temp_data/realObj/total.obj")
         #check_face_crosses_boundary(all_faces, all_verts.astype('float32'), half_box)
         self.vertices_zyx = all_verts[:,::-1].astype('float32')
         self.faces = all_faces
@@ -1153,7 +1150,8 @@ class Mesh:
         verts = self.vertices_zyx[:,::-1]
         faces = self.faces
         trimesh_mesh = trimesh.Trimesh(verts,faces)
-
+        verts = []
+        faces = []
         #the following is necessary because pydraco rounds by adding 0.5/scale, so need to make sure trimming happens at actual appropriate place
         #upper_bound = 2**position_quantization_bits
         #scale = upper_bound/(self.fragment_shape[0]*2**lod) # presently mesh vertices aren't readjusted by rescale, so they are eg at 1/4 their "actual position". hence need an extra factor of 2, ie. 2*lod 
@@ -1211,7 +1209,141 @@ class Mesh:
     def concatenate_mesh_bytes(cls, meshes, vertex_count, current_lod, highest_res_lod):
         return concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod)
 
-       
+    def simplify_by_facet(self):
+        def is_simple(edges):
+            _, counts = np.unique(edges, return_counts=True)
+            if np.any(counts>2):
+                return False
+            else:
+                return True
+
+        def split_nonsimple(vertices, edges, edges_face, faces, adjacency):
+            # get nonsimple vertex (those that have more than two edges )
+            unique_vertices, counts = np.unique(edges, return_counts=True)
+            nonsimple_vertices = [unique_vertices[idx] for idx,count in enumerate(counts) if count>2]
+
+            # for each such vertex
+            vertex_replacements = []
+            for nonsimple_vertex in nonsimple_vertices:
+                #get corresponding nonsimple edges, face_indices and faces
+                nonsimple_edges = []
+                nonsimple_face_indices = []
+                nonsimple_faces = []
+                for idx,edge in enumerate(edges):
+                    if nonsimple_vertex in edge:
+                        nonsimple_edges.append(edge)
+                        nonsimple_face_indices.append(edges_face[idx])
+                        nonsimple_faces.append(faces[edges_face[idx]])
+
+                # split sides of the nonsimple vertex based on adjacency
+                nonsimple_adjacency = [adjacent for adjacent in adjacency if adjacent[0] in nonsimple_face_indices and adjacent[1] in nonsimple_face_indices]
+                
+                for nonsimple_face_index in nonsimple_face_indices:
+                    nonsimple_adjacency.append([nonsimple_face_index, nonsimple_face_index]) #ensures that this works for when there is a single triangle on either side
+                connected_components = trimesh.graph.connected_components(nonsimple_adjacency)
+                # split nonsimple edges based one which side they are on
+                nonsimple_edges_split = []
+                for connected_component in connected_components:
+                    connected_component_edges = [edges[edge_idx] for edge_idx,face in enumerate(edges_face) if face in connected_component and edges[edge_idx] in nonsimple_edges]
+                    nonsimple_edges_split.append(connected_component_edges)
+
+                #create new vertex and update
+                for nonsimple_edges_oneside in nonsimple_edges_split:
+                    #choose first edge, arbitrarily
+                    other_vertex = [vertex for vertex in nonsimple_edges_oneside[0] if vertex != nonsimple_vertex][0]
+                    new_vertex= vertices[nonsimple_vertex] + (vertices[other_vertex]-vertices[nonsimple_vertex])*1E-2
+                    vertices = np.append(vertices,[new_vertex],axis=0)
+                    new_vertex_id = len(vertices)-1
+                    
+                    for nonsimple_edge_oneside in nonsimple_edges_oneside:
+                        idx = [idx for idx,edge in enumerate(edges) if edge==nonsimple_edge_oneside][0]                  
+                        edges.append([vertex if vertex != nonsimple_vertex else new_vertex_id for vertex in nonsimple_edge_oneside])
+                        edges_face.append(edges_face[idx])
+                        del edges[idx]
+                        del edges_face[idx]
+
+                    vertex_replacements.append([new_vertex, vertices[nonsimple_vertex]])
+
+            return vertices, edges, vertex_replacements
+
+        def get_facet_information(mesh, facet_index):
+            normal = mesh.facets_normal[facet_index]
+            origin = mesh._cache['facets_origin'][facet_index]
+            T = trimesh.geometry.plane_transform(origin, normal)
+
+            facet_face_indices = mesh.facets[facet_index]
+            edges = mesh.edges_sorted.reshape((-1, 6))[facet_face_indices].reshape((-1, 2))
+            edges_face = mesh.edges_face.reshape(-1,3)[facet_face_indices].reshape(-1)
+            group = trimesh.grouping.group_rows(edges, require_count=1)
+
+            edges_group = edges[group]
+            edges_face_group = edges_face[group]
+
+            vertex_ids = np.sort(np.unique(edges[group]))
+            vertices = trimesh.transform_points(mesh.vertices[vertex_ids], T)[:, :2]
+
+            for renumbered_vertex_id, current_vertex_id in enumerate(vertex_ids):
+                edges_group = np.where(edges_group==current_vertex_id, renumbered_vertex_id , edges_group)
+                edges_face_group = np.where(edges_face_group==current_vertex_id, renumbered_vertex_id , edges_face_group)
+
+            return T, edges_group, edges_face_group, vertices
+
+        verts = self.vertices_zyx[:,::-1]
+        faces = self.faces
+        self.vertices_zyx = []
+        self.faces = []
+        mesh = trimesh.Trimesh(verts,faces)
+        verts = []
+        faces = []
+        all_verts = []
+        all_faces = []
+        original_vertices = mesh.vertices
+        original_face_indices = [i for i in range(len(mesh.faces))]
+        adjusted_faces = []
+
+        for facet_index in range(len(mesh.facets)):
+            if(len(mesh.facets[facet_index]>2)):
+                adjusted_faces.extend(mesh.facets[facet_index].tolist())
+                T, edges_group, edges_face_group, vertices = get_facet_information(mesh, facet_index)
+                is_facet_simple = is_simple(edges_group)
+                if not is_facet_simple:
+                    vertices, edges_group, vertex_replacements = split_nonsimple(vertices, edges_group.tolist(), edges_face_group.tolist(), mesh.faces, mesh.face_adjacency.tolist())
+
+                polygon = trimesh.path.polygons.edges_to_polygons(edges=edges_group, vertices=vertices)
+
+                for current_polygon in polygon:
+                    current_polygon = current_polygon.simplify(1E-4,preserve_topology = True) #seems to work well
+                    verts,faces = trimesh.creation.triangulate_polygon(current_polygon,'p')
+
+                    if not is_facet_simple:
+                        for vertex_replacement in vertex_replacements:
+                            verts = np.where(verts==vertex_replacement[0], vertex_replacement[1] , verts)
+
+                    num_rows,_  = verts.shape
+                    vertices_new = np.zeros((num_rows, 3))
+                    vertices_new[:,:-1] = verts
+
+                    #transform back
+                    vertices_new = trimesh.transform_points(vertices_new,np.linalg.inv(T))
+
+                    if facet_index==0:
+                        all_verts = vertices_new
+                        all_faces = faces
+                    else:
+                        num_vertices = np.shape(all_verts)[0]
+                        all_verts = np.append(all_verts, vertices_new, axis=0)
+                        all_faces = np.append(all_faces, faces+num_vertices, axis=0)
+        # append faces that we skipped
+        unchanged_face_indices = list(set(original_face_indices).symmetric_difference(set(adjusted_faces)))
+        for unchanged_face_index in unchanged_face_indices:
+                num_vertices = np.shape(all_verts)[0]
+                all_verts = np.append(all_verts, original_vertices[mesh.faces[unchanged_face_index]], axis=0)
+                all_faces = np.append(all_faces, [np.array([0,1,2])+num_vertices], axis=0)
+        print("checkpoint 4")
+        self.vertices_zyx = all_verts[:,::-1].astype('float32')
+        self.faces = all_faces
+        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
 
 
 def concatenate_meshes(meshes, keep_normals=True):
