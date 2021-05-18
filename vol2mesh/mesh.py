@@ -1117,7 +1117,6 @@ class Mesh:
         trim_edges.append(min_box)
         trim_edges.append(half_box)
         trim_edges.append(max_box)
-        print(f"why failing {min_box} {max_box} {half_box}")
         submesh = 0
         for x in range(2):
             mesh_x = trimesh.intersections.slice_mesh_plane(mesh, plane_normal=nyz, plane_origin=trim_edges[x])
