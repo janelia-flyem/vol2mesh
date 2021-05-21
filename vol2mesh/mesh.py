@@ -79,6 +79,8 @@ class Mesh:
         for a in (self._vertices_zyx, self._faces, self._normals_zyx):
             assert a.ndim == 2 and a.shape[1] == 3, f"Input array has wrong shape: {a.shape}"
 
+        self.fullscale_fragment_shape = fragment_shape    
+        self.fullscale_fragment_origin = fragment_origin
         self.fragment_shape = fragment_shape
         self.fragment_origin = fragment_origin
        
@@ -510,7 +512,7 @@ class Mesh:
             self._faces = None
         return len(self._draco_bytes)
     
-    def _compress_as_custom_draco(self):
+    def _compress_as_custom_draco(self):           
         assert _dvidutils_available, \
             "Can't use draco compression if dvidutils isn't installed"
         if self._draco_bytes is None:
@@ -1109,7 +1111,7 @@ class Mesh:
     def trim_subchunks(self,mesh, min_box, max_box, position_quantization_bits):
         nyz, nxz, nxy = np.eye(3)
         #fragment_shape = max_box - min_box
-        half_box = (max_box+min_box)/2#*( 2**(position_quantization_bits-1)/1023 )
+        half_box = (max_box+min_box)/2.0#*( 2**(position_quantization_bits-1)/1023 )
 
         #partition_point = self.get_partition_point(fragment_shape, min_box, position_quantization_bits)
 
@@ -1145,7 +1147,6 @@ class Mesh:
     def trim(self, lod=0, position_quantization_bits=10, do_trim_subchunks=False):           
         min_box = self.fragment_origin
         max_box = self.fragment_origin + self.fragment_shape
-
         nyz, nxz, nxy = np.eye(3)
         verts = self.vertices_zyx[:,::-1]
         faces = self.faces
@@ -1178,6 +1179,7 @@ class Mesh:
                 self.faces = trimesh_mesh.faces.astype('uint32')
                 self.box = np.array( [ self.vertices_zyx.min(axis=0),
                                     np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+
             else:
                 self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
                 self.normals=np.zeros( (0,3), dtype=np.float32 )
@@ -1209,7 +1211,21 @@ class Mesh:
     def concatenate_mesh_bytes(cls, meshes, vertex_count, current_lod, highest_res_lod):
         return concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod)
 
-    def simplify_by_facet(self):
+    def quantize(self, position_quantization_bits):
+        upper_bound = 2**position_quantization_bits-1
+        upper_bound = np.array([upper_bound,upper_bound,upper_bound]).astype(int)
+        zero_array = np.array([0,0,0])
+        fragment_shape = self.fragment_shape.astype("double")
+        offset = self.fragment_origin.astype("double")
+        vertices = self.vertices_zyx[:,::-1]
+        
+        vertices = np.array([np.minimum( upper_bound, np.maximum(zero_array, (vertex-offset)*upper_bound/fragment_shape + 0.5) ) for vertex in vertices]).astype('float32')
+        self.vertices_zyx=vertices[:,::-1]
+        self.fragment_origin = np.asarray([0,0,0])
+        self.fragment_shape = upper_bound
+
+    def simplify_by_facet(self, position_quantization_bits):
+
         def is_simple(edges):
             _, counts = np.unique(edges, return_counts=True)
             if np.any(counts>2):
@@ -1241,6 +1257,7 @@ class Mesh:
                 for nonsimple_face_index in nonsimple_face_indices:
                     nonsimple_adjacency.append([nonsimple_face_index, nonsimple_face_index]) #ensures that this works for when there is a single triangle on either side
                 connected_components = trimesh.graph.connected_components(nonsimple_adjacency)
+
                 # split nonsimple edges based one which side they are on
                 nonsimple_edges_split = []
                 for connected_component in connected_components:
@@ -1287,7 +1304,8 @@ class Mesh:
                 edges_face_group = np.where(edges_face_group==current_vertex_id, renumbered_vertex_id , edges_face_group)
 
             return T, edges_group, edges_face_group, vertices
-
+        
+        self.quantize(position_quantization_bits)
         verts = self.vertices_zyx[:,::-1]
         faces = self.faces
         self.vertices_zyx = []
@@ -1339,7 +1357,7 @@ class Mesh:
                 num_vertices = np.shape(all_verts)[0]
                 all_verts = np.append(all_verts, original_vertices[mesh.faces[unchanged_face_index]], axis=0)
                 all_faces = np.append(all_faces, [np.array([0,1,2])+num_vertices], axis=0)
-        print("checkpoint 4")
+
         self.vertices_zyx = all_verts[:,::-1].astype('float32')
         self.faces = all_faces
         self.box = np.array( [ self.vertices_zyx.min(axis=0),
@@ -1416,6 +1434,8 @@ def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
         combined_meshes = []
         for fragment_origin, meshes_to_combine in combined_mesh_dictionary.items():
             combined_mesh = Mesh.concatenate_meshes(meshes_to_combine, keep_normals=False)
+            combined_mesh.fullscale_fragment_origin = np.array(fragment_origin)
+            combined_mesh.fullscale_fragment_shape = np.array(current_lod_brick_shape)
             combined_mesh.fragment_origin = np.array(fragment_origin)
             combined_mesh.fragment_shape = current_lod_brick_shape
             combined_meshes.append(combined_mesh)
