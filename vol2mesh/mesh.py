@@ -26,6 +26,7 @@ from .io_utils import TemporaryNamedPipe, AutoDeleteDir, stdout_redirected
 
 from functools import cmp_to_key
 import trimesh
+from simplify_wrapper import *
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class Mesh:
         self.fullscale_fragment_origin = fragment_origin
         self.fragment_shape = fragment_shape
         self.fragment_origin = fragment_origin
+        self.composite_fragments = None
        
         if box is not None:
             self.box = np.asarray(box)
@@ -253,7 +255,7 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, lod=0, method='ilastik', **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, lod=0, rescale_method="subsample", method='ilastik', **kwargs):
         """
         Alternate constructor.
         Run marching cubes on the given volume and return a Mesh object.
@@ -331,8 +333,10 @@ class Mesh:
                     vertices_zyx = vertices_xyz[:, ::-1]
                     normals_zyx = normals_xyz[:, ::-1]
                     faces[:] = faces[:, ::-1]
-
-                    vertices_zyx += 0.5/2**lod
+                    if rescale_method=="subsample":
+                        vertices_zyx += 0.5/2**lod
+                    else:
+                        vertices_zyx += 0.5
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -941,6 +945,21 @@ class Mesh:
             self.faces = np.asarray(simple.triangles).astype(np.uint32)
             print(f"max {np.amax(np.asarray(simple.vertices)[:,::-1])} {np.amax(self.vertices_zyx)}")
             self.vertices_zyx = np.asarray(simple.vertices)[:,::-1].astype(np.float32)
+    
+    def simplify_pySimplify(self, fraction):
+        # https://github.com/Kramer84/Py_Fast-Quadric-Mesh-Simplification
+        num_faces = len(self.faces)
+        if (num_faces>4):
+            mesh = trimesh.Trimesh(self.vertices_zyx[:,::-1],self.faces)
+            simplify = pySimplify()
+            simplify.setMesh(mesh)
+            simplify.simplify_mesh(target_count = int(num_faces*fraction), aggressiveness=7, preserve_border=True, verbose=0)
+            mesh_simplified = simplify.getMesh()
+            self.vertices_zyx = mesh_simplified.vertices[:,::-1].astype(np.float32)
+            self.faces = mesh_simplified.faces.astype(np.uint32)
+            self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                        np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+            
 
     def laplacian_smooth(self, iterations=1):
         """
@@ -1143,9 +1162,10 @@ class Mesh:
         self.faces = all_faces
         self.box = np.array( [ self.vertices_zyx.min(axis=0),
                                 np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+        
 
     def trim(self, lod=0, position_quantization_bits=10, do_trim_subchunks=False):           
-        min_box = self.fragment_origin
+        min_box = self.fragment_origin 
         max_box = self.fragment_origin + self.fragment_shape
         nyz, nxz, nxy = np.eye(3)
         verts = self.vertices_zyx[:,::-1]
@@ -1156,8 +1176,6 @@ class Mesh:
         #the following is necessary because pydraco rounds by adding 0.5/scale, so need to make sure trimming happens at actual appropriate place
         #upper_bound = 2**position_quantization_bits
         #scale = upper_bound/(self.fragment_shape[0]*2**lod) # presently mesh vertices aren't readjusted by rescale, so they are eg at 1/4 their "actual position". hence need an extra factor of 2, ie. 2*lod 
-        min_box = min_box#.astype('float64')
-        max_box = max_box#.astype('float64')
         #print(f"{scale} {self.fragment_shape} {min_box} {max_box}")
         if do_trim_subchunks:
             self.trim_subchunks(trimesh_mesh, min_box, max_box, position_quantization_bits)
@@ -1179,7 +1197,6 @@ class Mesh:
                 self.faces = trimesh_mesh.faces.astype('uint32')
                 self.box = np.array( [ self.vertices_zyx.min(axis=0),
                                     np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
-
             else:
                 self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
                 self.normals=np.zeros( (0,3), dtype=np.float32 )
@@ -1423,12 +1440,15 @@ def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
         bricks_to_combine = 2**(current_lod - highest_res_lod)
         current_lod_brick_shape = bricks_to_combine*brick_shape
         combined_mesh_dictionary = {}
+        #composite_fragment_dictionary = {}
         for mesh in meshes:
             fragment_origin = mesh.fragment_origin
             combined_fragment_origin = tuple( current_lod_brick_shape * (fragment_origin // current_lod_brick_shape) )
             if combined_fragment_origin in combined_mesh_dictionary:
+                #composite_fragment_dictionary[combined_fragment_origin] = np.append(composite_fragment_dictionary[combined_fragment_origin],np.array([fragment_origin]),axis=0)
                 combined_mesh_dictionary[combined_fragment_origin].append(mesh)
             else:
+                #composite_fragment_dictionary[combined_fragment_origin]= np.array([fragment_origin])
                 combined_mesh_dictionary[combined_fragment_origin] = [mesh]
 
         combined_meshes = []
@@ -1438,6 +1458,7 @@ def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
             combined_mesh.fullscale_fragment_shape = np.array(current_lod_brick_shape)
             combined_mesh.fragment_origin = np.array(fragment_origin)
             combined_mesh.fragment_shape = current_lod_brick_shape
+           #combined_mesh.composite_fragments = composite_fragment_dictionary[fragment_origin]//brick_shape
             combined_meshes.append(combined_mesh)
         
         return combined_meshes
