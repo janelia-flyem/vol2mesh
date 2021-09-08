@@ -13,7 +13,7 @@ import lz4.frame
 from vol2mesh.util import compute_nonzero_box, extract_subvol
 
 try:
-    from dvidutils import LabelMapper, encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
+    from dvidutils import LabelMapper, encode_faces_to_drc_bytes, encode_faces_to_custom_drc_bytes, decode_drc_bytes_to_faces
     _dvidutils_available = True
 except ImportError:
     _dvidutils_available = False
@@ -24,6 +24,10 @@ from .obj_utils import write_obj, read_obj
 from .ngmesh import read_ngmesh, write_ngmesh
 from .io_utils import TemporaryNamedPipe, AutoDeleteDir, stdout_redirected
 
+from functools import cmp_to_key
+import trimesh
+from simplify_wrapper import *
+
 logger = logging.getLogger(__name__)
 
 DRACO_USE_PIPE = False
@@ -32,9 +36,9 @@ class Mesh:
     """
     A class to hold the elements of a mesh.
     """
-    MESH_FORMATS = ('obj', 'drc', 'ngmesh')
+    MESH_FORMATS = ('obj', 'drc', 'custom_drc', 'ngmesh')
     
-    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, pickle_compression_method='lz4'):
+    def __init__(self, vertices_zyx, faces, normals_zyx=None, box=None, fragment_shape=None, fragment_origin=None, pickle_compression_method='lz4'):
         """
         Args:
             vertices_zyx: ndarray (N,3), float32
@@ -51,9 +55,9 @@ class Mesh:
             
             pickle_compression_method:
                 How (or whether) to compress vertices, normals, and faces during pickling.
-                Choices are: 'draco', 'lz4', or None.
+                Choices are: 'draco','custom_draco', 'lz4', or None.
         """
-        assert pickle_compression_method in (None, 'lz4', 'draco')
+        assert pickle_compression_method in (None, 'lz4', 'draco', 'custom_draco')
         self.pickle_compression_method = pickle_compression_method
         self._destroyed = False
         
@@ -76,6 +80,12 @@ class Mesh:
         for a in (self._vertices_zyx, self._faces, self._normals_zyx):
             assert a.ndim == 2 and a.shape[1] == 3, f"Input array has wrong shape: {a.shape}"
 
+        self.fullscale_fragment_shape = fragment_shape    
+        self.fullscale_fragment_origin = fragment_origin
+        self.fragment_shape = fragment_shape
+        self.fragment_origin = fragment_origin
+        self.composite_fragments = None
+       
         if box is not None:
             self.box = np.asarray(box)
             assert self.box.shape == (2,3) 
@@ -245,7 +255,7 @@ class Mesh:
 
 
     @classmethod
-    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, method='ilastik', **kwargs):
+    def from_binary_vol(cls, downsampled_volume_zyx, fullres_box_zyx=None, fragment_shape=None, fragment_origin=None, lod=0, rescale_method="subsample", method='ilastik', **kwargs):
         """
         Alternate constructor.
         Run marching cubes on the given volume and return a Mesh object.
@@ -323,8 +333,22 @@ class Mesh:
                     vertices_zyx = vertices_xyz[:, ::-1]
                     normals_zyx = normals_xyz[:, ::-1]
                     faces[:] = faces[:, ::-1]
+                    if rescale_method=="subsample":
+                        vertices_zyx += 0.5/2**lod
+                    else:
+                        #print("fragment_origin",np.unique(downsampled_volume_zyx))
+                        #preadjusted_fragment_origin = fragment_origin/2**lod
+                        #preadjusted_fragment_shape = fragment_shape/2**lod
+                        #vertices_zyx -= preadjusted_fragment_origin
+                        #vertices_zyx *= (preadjusted_fragment_shape-1)/preadjusted_fragment_shape
+                        #vertices_zyx += preadjusted_fragment_origin*(preadjusted_fragment_shape-1)/preadjusted_fragment_shape
+                        vertices_zyx += 0.5 #to center it
 
-                vertices_zyx += 0.5
+                        #temp = trimesh.Trimesh(vertices_zyx[:,::-1],faces)
+                        #temp.vertices -=0.1*temp.vertex_normals
+                        #vertices_zyx = temp.vertices[:,::-1].astype(np.float32)
+                        #faces = temp.faces.astype(np.uint32)
+                        #vertices_zyx -= 0.5*normals_zyx
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -337,9 +361,8 @@ class Mesh:
                 # Just return an empty mesh.
                 empty_vertices = np.zeros( (0, 3), dtype=np.float32 )
                 empty_faces = np.zeros( (0, 3), dtype=np.uint32 )
-                return Mesh(empty_vertices, empty_faces, box=fullres_box_zyx)
+                return Mesh(empty_vertices, empty_faces, box=fullres_box_zyx, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
             else:
-                logger.error("Error during mesh generation")
                 raise
     
         
@@ -347,7 +370,7 @@ class Mesh:
         vertices_zyx[:] *= resolution
         vertices_zyx[:] += fullres_box_zyx[0]
         
-        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx)
+        return Mesh(vertices_zyx, faces, normals_zyx, fullres_box_zyx, fragment_shape=fragment_shape, fragment_origin=fragment_origin)
 
 
     @classmethod
@@ -486,6 +509,8 @@ class Mesh:
             return self.vertices_zyx.nbytes + self.faces.nbytes + self.normals_zyx.nbytes
         elif method == 'draco':
             return self._compress_as_draco()
+        elif method == 'custom_draco':
+            return self._compress_as_custom_draco()
         elif method == 'lz4':
             return self._compress_as_lz4()
         else:
@@ -503,6 +528,16 @@ class Mesh:
             self._faces = None
         return len(self._draco_bytes)
     
+    def _compress_as_custom_draco(self):           
+        assert _dvidutils_available, \
+            "Can't use draco compression if dvidutils isn't installed"
+        if self._draco_bytes is None:
+            self._uncompress() # Ensure not currently compressed as lz4
+            self._draco_bytes = encode_faces_to_custom_drc_bytes(self._vertices_zyx[:,::-1], self._normals_zyx[:,::-1], self._faces, self._fragment_shape, self._fragment_origin, position_quantization_bits = 10)
+            self._vertices_zyx = None
+            self._normals_zyx = None
+            self._faces = None
+        return len(self._draco_bytes)
 
     def _compress_as_lz4(self):
         if self._lz4_items is None:
@@ -640,6 +675,25 @@ class Mesh:
     def normals_zyx(self, new_normals_zyx):
         self._normals_zyx = new_normals_zyx
     
+    @property
+    def fragment_shape(self):
+        return self._fragment_shape
+    
+    @fragment_shape.setter
+    def fragment_shape(self, new_fragment_shape):
+        self._fragment_shape = new_fragment_shape
+
+    @property
+    def fragment_origin(self):
+        return self._fragment_origin
+    
+    @fragment_origin.setter
+    def fragment_origin(self, new_fragment_origin):
+        self._fragment_origin = new_fragment_origin
+    
+    @property
+    def draco_bytes(self):
+        return self._draco_bytes
 
     def stitch_adjacent_faces(self, drop_unused_vertices=True, drop_duplicate_faces=True):
         """
@@ -889,6 +943,35 @@ class Mesh:
         # (Can decimation produce degenerate faces?)
         self.recompute_normals(True)
 
+    def simplify_open3d(self, fraction):
+        import open3d
+        print("get as open3d")
+        as_open3d = open3d.geometry.TriangleMesh(
+            vertices=open3d.utility.Vector3dVector(self.vertices_zyx[:,::-1]),
+            triangles=open3d.utility.Vector3iVector(self.faces))
+        print(f"got as open3d {len(self.faces)} {int(fraction*len(self.faces))}")
+        resulting_faces = int(fraction*len(self.faces))
+        if(resulting_faces>5):
+            simple = as_open3d.simplify_quadric_decimation(resulting_faces, boundary_weight=1E9)
+            print(f"simplified {resulting_faces}, {len(simple.triangles)}")
+            self.faces = np.asarray(simple.triangles).astype(np.uint32)
+            print(f"max {np.amax(np.asarray(simple.vertices)[:,::-1])} {np.amax(self.vertices_zyx)}")
+            self.vertices_zyx = np.asarray(simple.vertices)[:,::-1].astype(np.float32)
+    
+    def simplify_pySimplify(self, fraction):
+        # https://github.com/Kramer84/Py_Fast-Quadric-Mesh-Simplification
+        num_faces = len(self.faces)
+        if (num_faces>4):
+            mesh = trimesh.Trimesh(self.vertices_zyx[:,::-1],self.faces)
+            simplify = pySimplify()
+            simplify.setMesh(mesh)
+            simplify.simplify_mesh(target_count = int(num_faces*fraction), aggressiveness=7, preserve_border=True, verbose=0)
+            mesh_simplified = simplify.getMesh()
+            self.vertices_zyx = mesh_simplified.vertices[:,::-1].astype(np.float32)
+            self.faces = mesh_simplified.faces.astype(np.uint32)
+            self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                        np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+            
 
     def laplacian_smooth(self, iterations=1):
         """
@@ -1024,11 +1107,118 @@ class Mesh:
                     f.write(draco_bytes)
             else:
                 return draco_bytes
+        
+        elif fmt == 'custom_drc':
+            assert _dvidutils_available, \
+                "Can't use draco compression if dvidutils isn't installed"
+            draco_bytes = self._draco_bytes
+            if draco_bytes is None:
+                if self.normals_zyx.shape[0] == 0:
+                    self.recompute_normals(True) # See comment in Mesh.compress()
+                draco_bytes = encode_faces_to_custom_drc_bytes(self.vertices_zyx[:,::-1], self.normals_zyx[:,::-1], self.faces, self.fragment_shape, self.fragment_origin)
+            
+            if path:
+                with open(path, 'wb') as f:
+                    f.write(draco_bytes)
+            else:
+                return draco_bytes
+
         elif fmt == 'ngmesh':
             if path:
                 write_ngmesh(self.vertices_zyx[:,::-1], self.faces, path)
             else:
                 return write_ngmesh(self.vertices_zyx[:,::-1], self.faces)
+    
+    def get_partition_point(fragment_shape, fragment_origin, position_quantization_bits):
+        #https://github.com/google/neuroglancer/blob/8432f531c4d8eb421556ec36926a29d9064c2d3c/src/neuroglancer/mesh/draco/neuroglancer_draco.cc#L82-L83
+        scale = (2**position_quantization_bits-1)/fragment_shape
+        offset = 0.5/scale-fragment_origin
+        partition_point_as_int = 2**(position_quantization_bits-1)
+
+        partition_point = partition_point_as_int/scale - offset
+
+        return partition_point
+
+    def trim_subchunks(self,mesh, min_box, max_box, position_quantization_bits):
+        nyz, nxz, nxy = np.eye(3)
+        #fragment_shape = max_box - min_box
+        half_box = (max_box+min_box)/2.0#*( 2**(position_quantization_bits-1)/1023 )
+
+        #partition_point = self.get_partition_point(fragment_shape, min_box, position_quantization_bits)
+
+        trim_edges = []
+        trim_edges.append(min_box)
+        trim_edges.append(half_box)
+        trim_edges.append(max_box)
+        submesh = 0
+        for x in range(2):
+            mesh_x = trimesh.intersections.slice_mesh_plane(mesh, plane_normal=nyz, plane_origin=trim_edges[x])
+            mesh_x = trimesh.intersections.slice_mesh_plane(mesh_x, plane_normal=-nyz, plane_origin=trim_edges[x+1])
+            for y in range(2):
+                mesh_y = trimesh.intersections.slice_mesh_plane(mesh_x, plane_normal=nxz, plane_origin=trim_edges[y])
+                mesh_y = trimesh.intersections.slice_mesh_plane(mesh_y, plane_normal=-nxz, plane_origin=trim_edges[y+1])
+                for z in range(2):
+                    mesh_z = trimesh.intersections.slice_mesh_plane(mesh_y, plane_normal=nxy, plane_origin=trim_edges[z])
+                    mesh_z = trimesh.intersections.slice_mesh_plane(mesh_z, plane_normal=-nxy, plane_origin=trim_edges[z+1])
+                    if submesh==0:
+                        all_verts = mesh_z.vertices
+                        all_faces = mesh_z.faces
+                    else:
+                        num_vertices = np.shape(all_verts)[0]
+                        all_verts = np.append(all_verts, mesh_z.vertices, axis=0)
+                        all_faces = np.append(all_faces, mesh_z.faces+num_vertices, axis=0)
+                    submesh+=1
+        #check_face_crosses_boundary(all_faces, all_verts.astype('float32'), half_box)
+        if len(all_verts)>0:
+            self.vertices_zyx = all_verts[:,::-1].astype('float32')
+            self.faces = all_faces.astype('uint32')
+            self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+        else:
+            self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
+            self.normals=np.zeros( (0,3), dtype=np.float32 )
+            self.faces= np.zeros((0,3), np.uint32)
+
+        
+
+    def trim(self, lod=0, position_quantization_bits=10, do_trim_subchunks=False):           
+        min_box = self.fragment_origin 
+        max_box = self.fragment_origin + self.fragment_shape
+        nyz, nxz, nxy = np.eye(3)
+        verts = self.vertices_zyx[:,::-1]
+        faces = self.faces
+        trimesh_mesh = trimesh.Trimesh(verts,faces)
+        verts = []
+        faces = []
+        #the following is necessary because pydraco rounds by adding 0.5/scale, so need to make sure trimming happens at actual appropriate place
+        #upper_bound = 2**position_quantization_bits
+        #scale = upper_bound/(self.fragment_shape[0]*2**lod) # presently mesh vertices aren't readjusted by rescale, so they are eg at 1/4 their "actual position". hence need an extra factor of 2, ie. 2*lod 
+        #print(f"{scale} {self.fragment_shape} {min_box} {max_box}")
+        
+        if do_trim_subchunks:
+            self.trim_subchunks(trimesh_mesh, min_box, max_box, position_quantization_bits)
+        else:
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nyz, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nyz, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxz, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxz, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=nxy, plane_origin=min_box)
+            if len(trimesh_mesh.vertices)>0:
+                trimesh_mesh = trimesh.intersections.slice_mesh_plane(trimesh_mesh, plane_normal=-nxy, plane_origin=max_box)
+            if len(trimesh_mesh.vertices)>0:
+                self.vertices_zyx = trimesh_mesh.vertices[:,::-1].astype('float32')
+                self.faces = trimesh_mesh.faces.astype('uint32')
+                self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                    np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+            else:
+                self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
+                self.normals=np.zeros( (0,3), dtype=np.float32 )
+                self.faces= np.zeros((0,3), np.uint32)
 
 
     @classmethod
@@ -1051,6 +1241,162 @@ class Mesh:
             Mesh
         """
         return concatenate_meshes(meshes, keep_normals)
+
+    @classmethod
+    def concatenate_mesh_bytes(cls, meshes, vertex_count, current_lod, highest_res_lod):
+        return concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod)
+
+    def quantize(self, position_quantization_bits):
+        upper_bound = 2**position_quantization_bits-1
+        upper_bound = np.array([upper_bound,upper_bound,upper_bound]).astype(int)
+        zero_array = np.array([0,0,0])
+        fragment_shape = self.fragment_shape.astype("double")
+        offset = self.fragment_origin.astype("double")
+        vertices = self.vertices_zyx[:,::-1]
+        
+        vertices = np.array([np.minimum( upper_bound, np.maximum(zero_array, (vertex-offset)*upper_bound/fragment_shape + 0.5) ) for vertex in vertices]).astype('float32')
+        self.vertices_zyx=vertices[:,::-1]
+        self.fragment_origin = np.asarray([0,0,0])
+        self.fragment_shape = upper_bound
+
+    def simplify_by_facet(self, position_quantization_bits):
+
+        def is_simple(edges):
+            _, counts = np.unique(edges, return_counts=True)
+            if np.any(counts>2):
+                return False
+            else:
+                return True
+
+        def split_nonsimple(vertices, edges, edges_face, faces, adjacency):
+            # get nonsimple vertex (those that have more than two edges )
+            unique_vertices, counts = np.unique(edges, return_counts=True)
+            nonsimple_vertices = [unique_vertices[idx] for idx,count in enumerate(counts) if count>2]
+
+            # for each such vertex
+            vertex_replacements = []
+            for nonsimple_vertex in nonsimple_vertices:
+                #get corresponding nonsimple edges, face_indices and faces
+                nonsimple_edges = []
+                nonsimple_face_indices = []
+                nonsimple_faces = []
+                for idx,edge in enumerate(edges):
+                    if nonsimple_vertex in edge:
+                        nonsimple_edges.append(edge)
+                        nonsimple_face_indices.append(edges_face[idx])
+                        nonsimple_faces.append(faces[edges_face[idx]])
+
+                # split sides of the nonsimple vertex based on adjacency
+                nonsimple_adjacency = [adjacent for adjacent in adjacency if adjacent[0] in nonsimple_face_indices and adjacent[1] in nonsimple_face_indices]
+                
+                for nonsimple_face_index in nonsimple_face_indices:
+                    nonsimple_adjacency.append([nonsimple_face_index, nonsimple_face_index]) #ensures that this works for when there is a single triangle on either side
+                connected_components = trimesh.graph.connected_components(nonsimple_adjacency)
+
+                # split nonsimple edges based one which side they are on
+                nonsimple_edges_split = []
+                for connected_component in connected_components:
+                    connected_component_edges = [edges[edge_idx] for edge_idx,face in enumerate(edges_face) if face in connected_component and edges[edge_idx] in nonsimple_edges]
+                    nonsimple_edges_split.append(connected_component_edges)
+
+                #create new vertex and update
+                for nonsimple_edges_oneside in nonsimple_edges_split:
+                    #choose first edge, arbitrarily
+                    other_vertex = [vertex for vertex in nonsimple_edges_oneside[0] if vertex != nonsimple_vertex][0]
+                    new_vertex= vertices[nonsimple_vertex] + (vertices[other_vertex]-vertices[nonsimple_vertex])*1E-2
+                    vertices = np.append(vertices,[new_vertex],axis=0)
+                    new_vertex_id = len(vertices)-1
+                    
+                    for nonsimple_edge_oneside in nonsimple_edges_oneside:
+                        idx = [idx for idx,edge in enumerate(edges) if edge==nonsimple_edge_oneside][0]                  
+                        edges.append([vertex if vertex != nonsimple_vertex else new_vertex_id for vertex in nonsimple_edge_oneside])
+                        edges_face.append(edges_face[idx])
+                        del edges[idx]
+                        del edges_face[idx]
+
+                    vertex_replacements.append([new_vertex, vertices[nonsimple_vertex]])
+
+            return vertices, edges, vertex_replacements
+
+        def get_facet_information(mesh, facet_index):
+            normal = mesh.facets_normal[facet_index]
+            origin = mesh._cache['facets_origin'][facet_index]
+            T = trimesh.geometry.plane_transform(origin, normal)
+
+            facet_face_indices = mesh.facets[facet_index]
+            edges = mesh.edges_sorted.reshape((-1, 6))[facet_face_indices].reshape((-1, 2))
+            edges_face = mesh.edges_face.reshape(-1,3)[facet_face_indices].reshape(-1)
+            group = trimesh.grouping.group_rows(edges, require_count=1)
+
+            edges_group = edges[group]
+            edges_face_group = edges_face[group]
+
+            vertex_ids = np.sort(np.unique(edges[group]))
+            vertices = trimesh.transform_points(mesh.vertices[vertex_ids], T)[:, :2]
+
+            for renumbered_vertex_id, current_vertex_id in enumerate(vertex_ids):
+                edges_group = np.where(edges_group==current_vertex_id, renumbered_vertex_id , edges_group)
+                edges_face_group = np.where(edges_face_group==current_vertex_id, renumbered_vertex_id , edges_face_group)
+
+            return T, edges_group, edges_face_group, vertices
+        
+        self.quantize(position_quantization_bits)
+        verts = self.vertices_zyx[:,::-1]
+        faces = self.faces
+        self.vertices_zyx = []
+        self.faces = []
+        mesh = trimesh.Trimesh(verts,faces)
+        verts = []
+        faces = []
+        all_verts = []
+        all_faces = []
+        original_vertices = mesh.vertices
+        original_face_indices = [i for i in range(len(mesh.faces))]
+        adjusted_faces = []
+
+        for facet_index in range(len(mesh.facets)):
+            if(len(mesh.facets[facet_index]>2)):
+                adjusted_faces.extend(mesh.facets[facet_index].tolist())
+                T, edges_group, edges_face_group, vertices = get_facet_information(mesh, facet_index)
+                is_facet_simple = is_simple(edges_group)
+                if not is_facet_simple:
+                    vertices, edges_group, vertex_replacements = split_nonsimple(vertices, edges_group.tolist(), edges_face_group.tolist(), mesh.faces, mesh.face_adjacency.tolist())
+
+                polygon = trimesh.path.polygons.edges_to_polygons(edges=edges_group, vertices=vertices)
+
+                for current_polygon in polygon:
+                    current_polygon = current_polygon.simplify(1E-4,preserve_topology = True) #seems to work well
+                    verts,faces = trimesh.creation.triangulate_polygon(current_polygon,'p')
+
+                    if not is_facet_simple:
+                        for vertex_replacement in vertex_replacements:
+                            verts = np.where(verts==vertex_replacement[0], vertex_replacement[1] , verts)
+
+                    num_rows,_  = verts.shape
+                    vertices_new = np.zeros((num_rows, 3))
+                    vertices_new[:,:-1] = verts
+
+                    #transform back
+                    vertices_new = trimesh.transform_points(vertices_new,np.linalg.inv(T))
+
+                    if facet_index==0:
+                        all_verts = vertices_new
+                        all_faces = faces
+                    else:
+                        num_vertices = np.shape(all_verts)[0]
+                        all_verts = np.append(all_verts, vertices_new, axis=0)
+                        all_faces = np.append(all_faces, faces+num_vertices, axis=0)
+        # append faces that we skipped
+        unchanged_face_indices = list(set(original_face_indices).symmetric_difference(set(adjusted_faces)))
+        for unchanged_face_index in unchanged_face_indices:
+                num_vertices = np.shape(all_verts)[0]
+                all_verts = np.append(all_verts, original_vertices[mesh.faces[unchanged_face_index]], axis=0)
+                all_faces = np.append(all_faces, [np.array([0,1,2])+num_vertices], axis=0)
+
+        self.vertices_zyx = all_verts[:,::-1].astype('float32')
+        self.faces = all_faces
+        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+                                np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
 
 
 def concatenate_meshes(meshes, keep_normals=True):
@@ -1105,6 +1451,51 @@ def concatenate_meshes(meshes, keep_normals=True):
 
     return Mesh( concatenated_vertices, concatenated_faces, concatenated_normals, total_box )
 
+def concatenate_mesh_bytes(meshes, vertex_count, current_lod, highest_res_lod):
+    def group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod):
+        brick_shape = meshes[0].fragment_shape
+        # default brick size corresponds with highest lod
+        bricks_to_combine = 2**(current_lod - highest_res_lod)
+        current_lod_brick_shape = bricks_to_combine*brick_shape
+        combined_mesh_dictionary = {}
+        #composite_fragment_dictionary = {}
+        for mesh in meshes:
+            fragment_origin = mesh.fragment_origin
+            combined_fragment_origin = tuple( current_lod_brick_shape * (fragment_origin // current_lod_brick_shape) )
+            if combined_fragment_origin in combined_mesh_dictionary:
+                #composite_fragment_dictionary[combined_fragment_origin] = np.append(composite_fragment_dictionary[combined_fragment_origin],np.array([fragment_origin]),axis=0)
+                combined_mesh_dictionary[combined_fragment_origin].append(mesh)
+            else:
+                #composite_fragment_dictionary[combined_fragment_origin]= np.array([fragment_origin])
+                combined_mesh_dictionary[combined_fragment_origin] = [mesh]
+
+        combined_meshes = []
+        for fragment_origin, meshes_to_combine in combined_mesh_dictionary.items():
+            combined_mesh = Mesh.concatenate_meshes(meshes_to_combine, keep_normals=False)
+            combined_mesh.fullscale_fragment_origin = np.array(fragment_origin)
+            combined_mesh.fullscale_fragment_shape = np.array(current_lod_brick_shape)
+            combined_mesh.fragment_origin = np.array(fragment_origin)
+            combined_mesh.fragment_shape = current_lod_brick_shape
+           #combined_mesh.composite_fragments = composite_fragment_dictionary[fragment_origin]//brick_shape
+            combined_meshes.append(combined_mesh)
+        
+        return combined_meshes
+    
+    if not isinstance(meshes, list):
+        meshes = list(meshes)
+    if not isinstance(vertex_count,list):
+        vertex_count = list(vertex_count)
+    
+    meshes = [mesh for idx,mesh in enumerate(meshes) if vertex_count[idx]>0] # remove 0 sized meshes
+    meshes = group_meshes_into_larger_bricks(meshes, current_lod, highest_res_lod)
+
+    fragment_origins = [ mesh.fragment_origin//meshes[0].fragment_shape for mesh in meshes ] #fragment origin needs to be in this reduced form, eg (0,0,1), for z-curve order
+
+    # Sort in Z-curve order
+    meshes, fragment_origins = zip(*sorted(zip(meshes, fragment_origins), key=cmp_to_key(lambda x, y: _cmp_zorder(x[1], y[1]))))
+
+    return [meshes]
+        
 
 def _verify_concatenate_inputs(meshes, vertex_counts):
     normals_counts = np.fromiter((len(mesh.normals_zyx) for mesh in meshes), np.int64, len(meshes))
@@ -1152,3 +1543,38 @@ def _verify_concatenate_inputs(meshes, vertex_counts):
         msg += f"Wrote first matching mesh to {output_path} (host: {hostname})\n"
     
     raise RuntimeError(msg)
+
+def _cmp_zorder(lhs, rhs) -> bool:
+    def less_msb(x: int, y: int) -> bool:
+        return x < y and x < (x ^ y)
+
+    # Assume lhs and rhs array-like objects of indices.
+    assert len(lhs) == len(rhs)
+    # Will contain the most significant dimension.
+    msd = 2
+    # Loop over the other dimensions.
+    for dim in [1, 0]:
+        # Check if the current dimension is more significant
+        # by comparing the most significant bits.
+        if less_msb(lhs[msd] ^ rhs[msd], lhs[dim] ^ rhs[dim]):
+            msd = dim
+    return lhs[msd] - rhs[msd]
+
+def check_face_crosses_boundary(faces, vertices, chunk_size):
+        def edge_crosses_boundary(v1,v2, chunk_size):
+            v1_floored = v1//chunk_size
+            v2_floored = v2//chunk_size
+            if not np.array_equal(v1_floored, v2_floored):
+                for i in range(3):
+                    if v1_floored[i] != v2_floored[i] and np.mod(v1[i], chunk_size[i])!=0 and np.mod(v2[i],chunk_size[i])!=0:
+                        print(f"faillllll {v1} {v2}")
+                        print(f"floooooor {v1_floored} {v2_floored}")
+            return False
+
+        for face in faces:
+            v1 = vertices[face[0]]
+            v2 = vertices[face[1]]
+            v3 = vertices[face[2]]
+            edge_crosses_boundary(v1,v2,chunk_size)
+            edge_crosses_boundary(v1,v3,chunk_size)
+            edge_crosses_boundary(v2,v3,chunk_size)

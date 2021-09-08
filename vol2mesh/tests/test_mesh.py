@@ -88,10 +88,28 @@ def test_basic(binary_vol_input):
     unserialized = mesh.from_buffer(serialized, 'drc')
     assert len(unserialized.vertices_zyx) == len(mesh.vertices_zyx)
 
+    mesh = Mesh.from_binary_vol( binary_vol, data_box, fragment_shape = np.asarray(data_box[1]), fragment_origin = np.asarray(data_box[0]))
+    serialized = mesh.serialize(fmt='custom_drc')
+    unserialized = mesh.from_buffer(serialized, 'drc')
+    assert len(unserialized.vertices_zyx) == len(mesh.vertices_zyx)
+
     serialized = mesh.serialize(fmt='ngmesh')
     unserialized = mesh.from_buffer(serialized, 'ngmesh')
     assert len(unserialized.vertices_zyx) == len(mesh.vertices_zyx)
     
+def test_trim(binary_vol_input):
+    mesh = Mesh.from_binary_vol( binary_vol_input[0])
+    mesh.fragment_origin = np.array([25,25,25])
+    mesh.fragment_shape = np.array([50,50,50])
+    num_faces = len(mesh.faces)
+    mesh.trim()
+    assert len(mesh.faces) < num_faces
+
+    mesh = Mesh.from_binary_vol( binary_vol_input[0])
+    mesh.fragment_origin = np.array([125,125,125])
+    mesh.fragment_shape = np.array([50,50,50])
+    mesh.trim()
+    assert len(mesh.faces) == 0
 
 def test_blockwise(binary_vol_input):
     binary_vol, data_box, nonzero_box = binary_vol_input
@@ -223,6 +241,9 @@ def test_empty_mesh():
     assert len(mesh.vertices_zyx) == len(mesh.normals_zyx) == len(mesh.faces) == 0
 
     mesh.serialize(fmt='drc')
+    assert len(mesh.vertices_zyx) == len(mesh.normals_zyx) == len(mesh.faces) == 0
+
+    mesh.serialize(fmt='custom_drc')
     assert len(mesh.vertices_zyx) == len(mesh.normals_zyx) == len(mesh.faces) == 0
 
     mesh.compress()
@@ -486,6 +507,16 @@ def test_compress(binary_vol_input):
     # Draco is lossy, so we can't compare exactly.
     # Just make sure the arrays are at least of the correct shape.
     size = mesh.compress('draco')
+    assert size < uncompressed_size
+    assert (mesh.faces.shape == mesh_orig.faces.shape)
+    assert (mesh.vertices_zyx.shape == mesh_orig.vertices_zyx.shape)
+    assert (mesh.normals_zyx.shape == mesh_orig.normals_zyx.shape)
+
+
+    mesh = copy.deepcopy(mesh_orig)
+    mesh.fragment_shape = np.asarray(data_box[1])
+    mesh.fragment_origin = np.asarray(data_box[0])
+    size = mesh.compress('custom_draco')
     assert size < uncompressed_size
     assert (mesh.faces.shape == mesh_orig.faces.shape)
     assert (mesh.vertices_zyx.shape == mesh_orig.vertices_zyx.shape)
