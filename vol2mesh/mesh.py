@@ -336,7 +336,19 @@ class Mesh:
                     if rescale_method=="subsample":
                         vertices_zyx += 0.5/2**lod
                     else:
-                        vertices_zyx += 0.5
+                        #print("fragment_origin",np.unique(downsampled_volume_zyx))
+                        #preadjusted_fragment_origin = fragment_origin/2**lod
+                        #preadjusted_fragment_shape = fragment_shape/2**lod
+                        #vertices_zyx -= preadjusted_fragment_origin
+                        #vertices_zyx *= (preadjusted_fragment_shape-1)/preadjusted_fragment_shape
+                        #vertices_zyx += preadjusted_fragment_origin*(preadjusted_fragment_shape-1)/preadjusted_fragment_shape
+                        vertices_zyx += 0.5 #to center it
+
+                        #temp = trimesh.Trimesh(vertices_zyx[:,::-1],faces)
+                        #temp.vertices -=0.1*temp.vertex_normals
+                        #vertices_zyx = temp.vertices[:,::-1].astype(np.float32)
+                        #faces = temp.faces.astype(np.uint32)
+                        #vertices_zyx -= 0.5*normals_zyx
                 
             else:
                 msg = f"Unknown method: {method}"
@@ -1148,20 +1160,25 @@ class Mesh:
                 for z in range(2):
                     mesh_z = trimesh.intersections.slice_mesh_plane(mesh_y, plane_normal=nxy, plane_origin=trim_edges[z])
                     mesh_z = trimesh.intersections.slice_mesh_plane(mesh_z, plane_normal=-nxy, plane_origin=trim_edges[z+1])
-                    if len(mesh_z.vertices)>0:
-                        if submesh==0:
-                            all_verts = mesh_z.vertices
-                            all_faces = mesh_z.faces
-                        else:
-                            num_vertices = np.shape(all_verts)[0]
-                            all_verts = np.append(all_verts, mesh_z.vertices, axis=0)
-                            all_faces = np.append(all_faces, mesh_z.faces+num_vertices, axis=0)
-                        submesh+=1
+                    if submesh==0:
+                        all_verts = mesh_z.vertices
+                        all_faces = mesh_z.faces
+                    else:
+                        num_vertices = np.shape(all_verts)[0]
+                        all_verts = np.append(all_verts, mesh_z.vertices, axis=0)
+                        all_faces = np.append(all_faces, mesh_z.faces+num_vertices, axis=0)
+                    submesh+=1
         #check_face_crosses_boundary(all_faces, all_verts.astype('float32'), half_box)
-        self.vertices_zyx = all_verts[:,::-1].astype('float32')
-        self.faces = all_faces
-        self.box = np.array( [ self.vertices_zyx.min(axis=0),
+        if len(all_verts)>0:
+            self.vertices_zyx = all_verts[:,::-1].astype('float32')
+            self.faces = all_faces.astype('uint32')
+            self.box = np.array( [ self.vertices_zyx.min(axis=0),
                                 np.ceil( self.vertices_zyx.max(axis=0) ) ] ).astype(np.int32)
+        else:
+            self.vertices_zyx=np.zeros( (0, 3), dtype=np.float32 )
+            self.normals=np.zeros( (0,3), dtype=np.float32 )
+            self.faces= np.zeros((0,3), np.uint32)
+
         
 
     def trim(self, lod=0, position_quantization_bits=10, do_trim_subchunks=False):           
@@ -1177,6 +1194,7 @@ class Mesh:
         #upper_bound = 2**position_quantization_bits
         #scale = upper_bound/(self.fragment_shape[0]*2**lod) # presently mesh vertices aren't readjusted by rescale, so they are eg at 1/4 their "actual position". hence need an extra factor of 2, ie. 2*lod 
         #print(f"{scale} {self.fragment_shape} {min_box} {max_box}")
+        
         if do_trim_subchunks:
             self.trim_subchunks(trimesh_mesh, min_box, max_box, position_quantization_bits)
         else:
