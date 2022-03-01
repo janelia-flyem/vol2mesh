@@ -13,12 +13,11 @@ import lz4.frame
 from vol2mesh.util import compute_nonzero_box, extract_subvol, has_nonzero_edges
 
 try:
-    from dvidutils import LabelMapper, encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
+    from dvidutils import encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
     _dvidutils_available = True
 except ImportError:
     _dvidutils_available = False
-    
-from .util import first_occurrences
+
 from .normals import compute_face_normals, compute_vertex_normals
 from .obj_utils import write_obj, read_obj
 from .ngmesh import read_ngmesh, write_ngmesh
@@ -472,7 +471,7 @@ class Mesh:
 
         mesh = concatenate_meshes(meshes)
         if stitch:
-            mesh.stitch_adjacent_faces(drop_unused_vertices=True, drop_duplicate_faces=True)
+            mesh.stitch_adjacent_faces()
         return mesh
 
 
@@ -643,129 +642,86 @@ class Mesh:
     @auto_uncompress
     def normals_zyx(self):
         return self._normals_zyx
-    
+
     @normals_zyx.setter
     @auto_uncompress
     def normals_zyx(self, new_normals_zyx):
         self._normals_zyx = new_normals_zyx
-    
 
-    def stitch_adjacent_faces(self, drop_unused_vertices=True, drop_duplicate_faces=True):
+    def sort_vertices(self):
         """
-        Search for duplicate vertices and remove all references to them in self.faces,
-        by replacing them with the index of the first matching vertex in the list.
+        Sort the vertex list lexicographically,
+        while keeping the normals and faces arrays in sync.
+        """
+        order = np.lexsort(self.vertices_zyx.T[::-1])
+        self.vertices_zyx = self.vertices_zyx[order]
+        if len(self.normals_zyx) > 0:
+            self.normals_zyx = self.normals_zyx[order]
+
+        # The 'order' array can be thought of as a function from "sorted rank" to "original index":
+        #   order[rank] -> original_index
+        # If you argsort THAT, you get the inverse function[1], from "original index" to "sorted rank":
+        #   inv_order[original_index] -> rank
+        # We can use the latter to remap the IDs in self.faces
+        #
+        # [1]: Note that for any 1-D array A, the following holds:
+        #   assert (argsort(A) == argsort(argsort(argsort(A)))).all()
+        #
+        inv_order = np.argsort(order).astype(np.uint32)
+        self.faces = inv_order[self.faces]
+
+    def stitch_adjacent_faces(self):
+        """
+        Identify duplicate vertices and remove them.
+        Update vertex references in self.faces as needed to make sure no faces reference a deleted vertex.
+        Also remove duplicate faces.
         Works in-place.
-        
+
         Note: Normals are recomputed iff they were present originally.
-        
-        Args:
-            drop_unused_vertices:
-                If True, drop the unused (duplicate) vertices from self.vertices_zyx
-                (since no faces refer to them any more, this saves some RAM).
-            
-            drop_duplicate_faces:
-                If True, remove faces with an identical
-                vertex list to any previous face.
-        
-        Returns:
-            False if no stitching was performed (none was needed),
-            or True otherwise.
-        
         """
-        # Late import: pandas is optional if you don't need all functions
-        import pandas as pd
-        need_normals = (self.normals_zyx.shape[0] > 0)
+        # If we sort the vertices, finding duplicates is easy with np.diff
+        self.sort_vertices()
+        v = self.vertices_zyx
+        non_dup = np.diff(v, axis=0, prepend=(v[:1] + 1)).any(axis=1)
 
-        mapping_pairs = first_occurrences(self.vertices_zyx)
-        
-        dup_indices, orig_indices = mapping_pairs.transpose()
-        if len(dup_indices) == 0:
-            if need_normals:
-                self.recompute_normals(True)
-            return False # No stitching was needed.
+        if non_dup.all():
+            self.drop_duplicate_faces()
+            return
 
-        del mapping_pairs
+        # Drop duplicate vertices
+        self.vertices_zyx = self.vertices_zyx[non_dup]
 
-        # Discard old normals
-        self.drop_normals()
+        # Remap vertex IDs in the faces array to match the new vertices.
+        # Since we sorted the vertices above, the remap array is simply an
+        # array of consecutive integers, but with "forward-fill"
+        # in the rows corresponding to duplicates.
+        # We simulate a pandas DataFrame.groupby().ffill() using np.maximum.accumulate()
+        remap = np.zeros(len(v), dtype=np.uint32)
+        remap[non_dup] = np.arange(len(self.vertices_zyx))
+        remap = np.maximum.accumulate(remap)
+        self.faces = remap[self.faces]
 
-        # Remap faces to no longer refer to the duplicates
-        if _dvidutils_available:
-            mapper = LabelMapper(dup_indices, orig_indices)
-            mapper.apply_inplace(self.faces, allow_unmapped=True)
-            del mapper
-        else:
-            mapping = np.arange(len(self.vertices_zyx), dtype=np.int32)
-            mapping[dup_indices] = orig_indices
-            self.faces[:] = mapping[self.faces]
-            del mapping
+        # Deduplicating vertices might reveal duplicated faces
+        self.drop_duplicate_faces()
 
-        del orig_indices
-        del dup_indices
-        
-        # Now the faces have been stitched, but the duplicate
-        # vertices are still unnecessarily present,
-        # and the face vertex indexes still reflect that.
-        # Also, we may have uncovered duplicate faces now that the
-        # vertexes have been canonicalized.
-
-        if drop_unused_vertices:
-            self.drop_unused_vertices()
-
-        def _drop_duplicate_faces():
-            # Normalize face vertex order before checking for duplicates.
-            # Technically, this means we don't distinguish
-            # betweeen clockwise/counter-clockwise ordering,
-            # but that seems unlikely to be a problem in practice.
-            sorted_faces = pd.DataFrame(np.sort(self.faces, axis=1))
-            duplicate_faces_mask = sorted_faces.duplicated().values
-            faces_df = pd.DataFrame(self.faces)
-            faces_df.drop(duplicate_faces_mask.nonzero()[0], inplace=True)
-            self.faces = np.asarray(faces_df.values, order='C')
-
-        if drop_duplicate_faces:
-            _drop_duplicate_faces()
-
-        if need_normals:
+        if len(self.normals_zyx) > 0:
             self.recompute_normals(True)
 
-        return True # stitching was needed.
-
-
-    def drop_unused_vertices(self):
-        """
-        Drop all unused vertices (and corresponding normals) from the mesh,
-        defined as vertex indices that are not referenced by any faces.
-        """
-        # Late import: pandas is optional if you don't need all functions
-        import pandas as pd
-
-        _used_vertices = pd.Series(self.faces.reshape(-1)).unique()
-        all_vertices = pd.DataFrame(np.arange(len(self.vertices_zyx), dtype=int), columns=['vertex_index'])
-        unused_vertices = all_vertices.query('vertex_index not in @_used_vertices')['vertex_index'].values
-
-        # Calculate shift:
-        # Determine number of duplicates above each vertex in the list
-        drop_mask = np.zeros((self.vertices_zyx.shape[0]), bool)
-        drop_mask[(unused_vertices,)] = True
-        cumulative_dupes = np.zeros(drop_mask.shape[0]+1, np.uint32)
-        np.add.accumulate(drop_mask, out=cumulative_dupes[1:])
-
-        # Renumber the faces
-        orig = np.arange(len(self.vertices_zyx), dtype=np.uint32)
-        shiftmap = orig - cumulative_dupes[:-1]
-        self.faces = shiftmap[self.faces]
-
-        # Delete the unused vertexes
-        self.vertices_zyx = np.delete(self.vertices_zyx, unused_vertices, axis=0)
-        if len(self.normals_zyx) > 0:
-            self.normals_zyx = np.delete(self.normals_zyx, unused_vertices, axis=0)
-
+    def drop_duplicate_faces(self):
+        # Normalize face vertex order before checking for duplicates.
+        # Technically, this means we don't distinguish
+        # betweeen clockwise/counter-clockwise ordering,
+        # but that seems unlikely to be a problem in practice.
+        f = np.sort(self.faces, axis=1)
+        order = np.lexsort(f.T[::-1])
+        f = f[order]
+        not_dup = np.diff(f, axis=0, prepend=(f[:1] + 1)).any(axis=1)
+        self.faces = self.faces[order][not_dup]
 
     def recompute_normals(self, remove_degenerate_faces=True):
         """
         Compute the normals for this mesh.
-        
+
         remove_degenerate_faces:
             If True, faces with no area (i.e. just lines) will be removed.
             (They have no effect on the vertex normals either way.)
@@ -902,11 +858,11 @@ class Mesh:
     def laplacian_smooth(self, iterations=1):
         """
         Smooth the mesh in-place.
-         
+
         This is simplest mesh smoothing technique, known as Laplacian Smoothing.
         Relocates each vertex by averaging its position with those of its adjacent neighbors.
         Repeat for N iterations.
-        
+
         Disadvantage: Results in overall shrinkage of the mesh, especially for many iterations.
                       (But nearly all smoothing techniques cause at least some shrinkage.)
 
@@ -916,7 +872,7 @@ class Mesh:
             iterations:
                 How many passes to take over the data.
                 More iterations results in a smoother mesh, but more shrinkage (and more CPU time).
-        
+
         TODO: Variations of this technique can give refined results.
             - Try weighting the influence of each neighbor by it's distance to the center vertex.
             - Try smaller displacement steps for each iteration
@@ -924,33 +880,28 @@ class Mesh:
             - Try smoothing "boundary" meshes independently from the rest of the mesh (less shrinkage)
             - Try "Cotangent Laplacian Smoothing"
         """
-        # Late import: pandas is optional if you don't need all functions
-        import pandas as pd
-
         if iterations == 0:
             if self.normals_zyx.shape[0] == 0:
                 self.recompute_normals(True)
             return
-        
+
         # Always discard old normals
         self.normals_zyx = np.zeros((0,3), np.float32)
 
         # Compute the list of all unique vertex adjacencies
-        all_edges = np.concatenate( [self.faces[:,(0,1)],
-                                     self.faces[:,(1,2)],
-                                     self.faces[:,(2,0)]] )
-        all_edges.sort(axis=1)
-        edges_df = pd.DataFrame( all_edges, columns=['v1_id', 'v2_id'] )
-        edges_df.drop_duplicates(inplace=True)
-        del all_edges
+        edges = np.concatenate( [self.faces[:, (0,1)],
+                                 self.faces[:, (1,2)],
+                                 self.faces[:, (2,0)]] )
 
-        # (This sort isn't technically necessary, but it might give
-        # better cache locality for the vertex lookups below.)
-        edges_df.sort_values(['v1_id', 'v2_id'], inplace=True)
+        # Drop duplicates
+        edges.sort(axis=1)
+        edges = edges[np.lexsort(edges.T)]
+        non_dups = np.diff(edges, axis=0, prepend=(edges[:1] + 1)).any(axis=1)
+        edges = edges[non_dups]
 
         # How many neighbors for each vertex == how many times it is mentioned in the edge list
-        neighbor_counts = np.bincount(edges_df.values.reshape(-1), minlength=len(self.vertices_zyx))
-        
+        neighbor_counts = np.bincount(edges.ravel(), minlength=len(self.vertices_zyx))
+
         new_vertices_zyx = np.empty_like(self.vertices_zyx)
         for _ in range(iterations):
             new_vertices_zyx[:] = self.vertices_zyx
@@ -967,10 +918,11 @@ class Mesh:
             #    and "fancy indexing" behavior is undefined in that case.
             #
             # Instead, it turns out that np.ufunc.at() works (it's an "unbuffered" operation)
-            np.add.at(new_vertices_zyx, edges_df['v1_id'], self.vertices_zyx[edges_df['v2_id'], :])
-            np.add.at(new_vertices_zyx, edges_df['v2_id'], self.vertices_zyx[edges_df['v1_id'], :])
+            np.add.at(new_vertices_zyx, edges[:, 0], self.vertices_zyx[edges[:, 1], :])
+            np.add.at(new_vertices_zyx, edges[:, 1], self.vertices_zyx[edges[:, 0], :])
 
-            new_vertices_zyx[:] /= (neighbor_counts[:,None] + 1) # plus one because each point itself is included in the sum
+            # Here, '+1' because each point itself is included in the sum
+            new_vertices_zyx[:] /= (neighbor_counts[:, None] + 1)
 
             # Swap (save RAM allocation overhead by reusing the new_vertices_zyx array between iterations)
             self.vertices_zyx, new_vertices_zyx = new_vertices_zyx, self.vertices_zyx

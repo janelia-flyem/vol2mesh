@@ -67,9 +67,6 @@ Appendix: Dependencies
 - The default marching cubes implementation is from the ilastik project's [`marching_cubes` library][marching_cubes].
   - Optionally, we support `skimage.marching_cubes_lewiner()` as an alternative, but you must install `scikit-image` yourself (it is not pulled in as a required dependency.
 - Computation of vertex normals is *slightly* (2x) faster if you have [`numba`][numba] installed, but it's not a required dependency. 
-- If you don't need the following methods, then `pandas` is not required:
-  - `Mesh.stitch_adjacent_faces()`
-  - `Mesh.laplacian_smooth()` (Note: the `ilastik` marching cubes implementation has smoothing built-in, so you might never need this function, which smooths a mesh after initial creation.  For example, this works without `pandas`: `mesh = Mesh.from_binary_vol(vol, smoothing_rounds=3)`)
 
 
 [dvidutils]: https://github.com/stuarteberg/dvidutils
