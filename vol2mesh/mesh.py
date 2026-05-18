@@ -5,6 +5,7 @@ import logging
 import tarfile
 import functools
 import subprocess
+import threading
 from io import BytesIO
 from itertools import chain
 from contextlib import contextmanager
@@ -14,6 +15,8 @@ import lz4.frame
 from scipy.ndimage import find_objects
 import pyfqmr
 from vol2mesh.util import compute_nonzero_box, extract_subvol, has_nonzero_edges
+
+PYFQMR_LOCK = threading.Lock()
 
 try:
     from dvidutils import encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
@@ -786,21 +789,27 @@ class Mesh:
         else:
             self.normals_zyx = compute_vertex_normals(self.vertices_zyx, self.faces, face_normals=face_normals)
 
-    def simplify(self, fraction):
+    def simplify(self, fraction, **kwargs):
         if fraction is None or fraction == 1.0:
             return
 
-        simplifier = pyfqmr.Simplify()
-        simplifier.setMesh(self.vertices_zyx, self.faces)
-        target_face_count = int(fraction * len(self.faces))
-        simplifier.simplify_mesh(
-            target_face_count,
-            aggressiveness=7,
-            preserve_border=True,
-            lossless=False
-        )
+        # Claude discovered that pyfqmr is not thread-safe (as of v0.3.0),
+        # as it stores vertexes and faces in a global variable.
+        with PYFQMR_LOCK:
+            simplifier = pyfqmr.Simplify()
+            simplifier.setMesh(self.vertices_zyx, self.faces)
+            target_face_count = int(fraction * len(self.faces))
 
-        vertices_zyx, faces, _face_normals = simplifier.getMesh()
+            _kwargs = {
+                'aggressiveness': 7,
+                'preserve_border': True,
+                'lossless': False
+            }
+            _kwargs.update(kwargs)
+
+            simplifier.simplify_mesh(target_face_count, **_kwargs)
+            vertices_zyx, faces, _face_normals = simplifier.getMesh()
+
         self.vertices_zyx = vertices_zyx.astype(np.float32)
         self.faces = faces.astype(np.int32)
 
