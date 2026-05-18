@@ -810,10 +810,15 @@ class Mesh:
             simplifier.simplify_mesh(target_face_count, **_kwargs)
             vertices_zyx, faces, _face_normals = simplifier.getMesh()
 
+        bad_faces = (faces >= len(vertices_zyx)).any(axis=1)
+        if bad_faces.any():
+            logger.warning(f"Simplification produced {bad_faces.sum()} faces that reference non-existent vertices! Dropping them.")
+            faces = faces[~bad_faces]
+
         self.vertices_zyx = vertices_zyx.astype(np.float32)
         self.faces = faces.astype(np.int32)
 
-        # Force normal reomputation to eliminate possible degenerate faces
+        # Force normal recomputation to eliminate possible degenerate faces
         # (Can decimation produce degenerate faces?)
         self.recompute_normals(True)
 
