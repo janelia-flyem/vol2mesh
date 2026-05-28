@@ -34,10 +34,13 @@ requirements:
     - lz4 >=2
     - scikit-image >=0.13
     - numba
-    - openmesh-python
     - marching_cubes >=0.2
     - pyfqmr
-    - dvidutils >=0.0.post81
+
+    # As of 2026-05, openmesh-python isn't available for osx-arm64.
+    # It's an optional dependency (late import) in vol2mesh anyway.
+    #- openmesh-python
+
 
 test:
   imports:
