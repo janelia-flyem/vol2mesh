@@ -41,6 +41,11 @@ requirements:
     # It's an optional dependency (late import) in vol2mesh anyway.
     #- openmesh-python
 
+    # To support windows builds, I'm removing this dependency.  Users will have to install it themselves.
+    # If I keep it in, I can't make this package noarch, and I'd have to build on windows explicitly.
+    # One option would be to add a 'base' package that adds this dependency back.
+    # (Another option is to actually build on Windows.)
+    # - dvidutils >=0.0.post81  # [not win]
 
 test:
   imports:
