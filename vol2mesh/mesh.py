@@ -413,14 +413,14 @@ class Mesh:
 
             labels = sorted({*labels} - {0})
 
+        boxes = cls._label_boxes(downsampled_volume_zyx, list(labels))
+
         if progress:
             try:
                 from tqdm import tqdm
                 labels = tqdm(labels)
             except ImportError:
                 pass
-
-        boxes = cls._label_boxes(downsampled_volume_zyx, labels)
 
         meshes = {}
         for label in labels:
