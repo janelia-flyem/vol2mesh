@@ -102,9 +102,15 @@ def read_obj(mesh_bytestream):
     else:
         mesh_bytes = mesh_bytestream.read()
 
+    def strip_comments(code: str) -> str:
+        return b'\n'.join(
+            line for line in code.splitlines()
+            if line.strip() and not line.lstrip().startswith(b'#')
+        )
+    mesh_bytes = strip_comments(mesh_bytes)
+
     # For faces, remove everything but the vertex index
     mesh_bytes = re.sub(rb'(\d+)/\S+', rb'\1', mesh_bytes)
-
     # Read as CSV
     df = pd.read_csv(BytesIO(mesh_bytes), sep=' ', header=None, names=['element', *'xyz'])
     vertices_xyz = df.query('element == "v"')[[*'xyz']].values.astype(np.float32)
