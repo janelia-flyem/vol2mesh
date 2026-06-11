@@ -17,6 +17,10 @@ from vol2mesh.multires import (
     zorder_positions,
     trim_mesh_to_box,
     encode_fragment,
+    encode_object_mesh,
+    decode_fragment,
+    build_info,
+    split_mesh_into_cells,
 )
 
 
@@ -216,6 +220,84 @@ class TestMultires(unittest.TestCase):
         # vertex set differs from the clip-only result.
         assert v_trim.shape != v_clip.shape or not np.array_equal(
             np.sort(v_trim, axis=0), np.sort(v_clip, axis=0))
+
+    def test_build_info(self):
+        info = build_info(vertex_quantization_bits=16,
+                          transform=[8, 0, 0, 0, 0, 8, 0, 0, 0, 0, 8, 0],
+                          lod_scale_multiplier=2.0)
+        assert info["@type"] == "neuroglancer_multilod_draco"
+        assert info["vertex_quantization_bits"] == 16
+        assert info["lod_scale_multiplier"] == 2.0
+        assert len(info["transform"]) == 12
+
+    def test_decode_fragment_inverts_encode(self):
+        chunk = np.array([100.0, 100.0, 100.0])
+        origin = np.array([0.0, 0.0, 0.0])
+        pos = (1, 2, 3)
+        v_xyz, faces = _cube_mesh(np.array(pos) * chunk + 20.0, 60.0)
+
+        draco = encode_fragment((v_xyz, faces), pos, chunk, origin, vertex_quantization_bits=16)
+        dv, df = decode_fragment(draco, pos, chunk, origin, vertex_quantization_bits=16)
+
+        step = 100.0 / ((1 << 16) - 1)
+        # Each original vertex is recovered to within ~one quantization step.
+        for ev in v_xyz:
+            assert np.linalg.norm(dv - ev, axis=1).min() <= np.sqrt(3) * step + 1e-6
+
+    def test_encode_object_mesh_bytes_and_passthrough(self):
+        chunk = np.array([256.0, 256.0, 256.0])
+        origin = np.array([0.0, 0.0, 0.0])
+        cells = {(0, 0, 0): None, (1, 0, 0): None, (2, 1, 3): None}
+        for cell in cells:
+            corner = np.array(cell) * 256.0
+            cells[cell] = _cube_mesh(corner + 30.0, 100.0)  # (vertices_xyz, faces)
+
+        # (a) Encoding to bytes and writing them out matches write_object_mesh on disk.
+        data_bytes, index_bytes, n = encode_object_mesh(cells, chunk, origin)
+        assert n == 3 and len(data_bytes) > 0 and len(index_bytes) > 0
+
+        d = tempfile.mkdtemp()
+        write_info(d, vertex_quantization_bits=16)
+        with open(f"{d}/777", "wb") as f:
+            f.write(data_bytes)
+        with open(f"{d}/777.index", "wb") as f:
+            f.write(index_bytes)
+        res = read_object_mesh(d, 777)
+        assert res["num_fragments_per_lod"][0] == 3
+
+        # (b) Pre-encoded fragment bytes pass through verbatim and produce an
+        # identical object to encoding the meshes directly.
+        prebytes = {cell: encode_fragment(m, cell, chunk, origin) for cell, m in cells.items()}
+        data2, index2, n2 = encode_object_mesh(prebytes, chunk, origin)
+        assert (data2, index2, n2) == (data_bytes, index_bytes, n)
+
+    def test_split_then_encode_roundtrip(self):
+        # A mesh spanning multiple cells, split and encoded, decodes back in-cell.
+        cell_size_zyx = np.array([64.0, 64.0, 64.0])
+        N = 96
+        zz, yy, xx = np.ogrid[:N, :N, :N]
+        c = N / 2
+        vol = ((zz - c)**2 + (yy - c)**2 + (xx - c)**2) <= 30**2
+        mesh = Mesh.from_binary_vol(vol, method='skimage')
+
+        frags = split_mesh_into_cells(mesh, cell_size_zyx)
+        assert len(frags) > 1
+        chunk_xyz = cell_size_zyx[::-1]
+        data, index, n = encode_object_mesh(frags, chunk_xyz, [0, 0, 0])
+        assert n == len(frags)
+
+        d = tempfile.mkdtemp()
+        write_info(d, vertex_quantization_bits=16)
+        with open(f"{d}/1", "wb") as f:
+            f.write(data)
+        with open(f"{d}/1.index", "wb") as f:
+            f.write(index)
+        res = read_object_mesh(d, 1)
+        ch = res['chunk_shape_xyz']
+        for frag in res['fragments']:
+            lo = res['grid_origin_xyz'] + frag['position'] * ch
+            v = frag['vertices_xyz']
+            assert (v >= lo - 1e-3).all() and (v <= lo + ch + 1e-3).all()
 
     def test_empty_object(self):
         d = tempfile.mkdtemp()
