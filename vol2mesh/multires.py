@@ -126,9 +126,61 @@ def quantize_fragment_vertices(vertices_xyz, fragment_position,
     return q
 
 
+def trim_mesh_to_box(vertices_xyz, faces, box_lo_xyz, box_hi_xyz):
+    """
+    Trim a mesh to an axis-aligned box by slicing its triangles at each of
+    the box's 6 planes.  Triangles straddling a plane are cut (introducing
+    new vertices exactly on the plane) and the outside portion is dropped;
+    no caps are added, so the mesh stays "open" at the cut.
+
+    This is the geometric alternative to coordinate clipping: instead of
+    collapsing overhanging triangles onto the cell face, it removes the
+    overhang and leaves clean boundary vertices on the face.  Adjacent
+    fragments cut against the same shared plane therefore line up closely
+    (especially if they were generated with a wide halo and smoothed
+    identically).
+
+    Requires the optional ``trimesh`` package.
+
+    Args:
+        vertices_xyz:
+            (N, 3) float vertex array, XYZ order.
+        faces:
+            (M, 3) integer face array.
+        box_lo_xyz, box_hi_xyz:
+            (3,) float min/max corners of the box, XYZ order.
+
+    Returns:
+        (vertices_xyz, faces) of the trimmed mesh.
+    """
+    from trimesh.intersections import slice_faces_plane
+
+    v = np.asarray(vertices_xyz, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    box_lo_xyz = np.asarray(box_lo_xyz, dtype=np.float64)
+    box_hi_xyz = np.asarray(box_hi_xyz, dtype=np.float64)
+
+    # (point on plane, inward normal). slice_faces_plane keeps the side the
+    # normal points toward, so the inward normals retain the box interior.
+    planes = [
+        (box_lo_xyz, np.array([ 1.0,  0.0,  0.0])),
+        (box_hi_xyz, np.array([-1.0,  0.0,  0.0])),
+        (box_lo_xyz, np.array([ 0.0,  1.0,  0.0])),
+        (box_hi_xyz, np.array([ 0.0, -1.0,  0.0])),
+        (box_lo_xyz, np.array([ 0.0,  0.0,  1.0])),
+        (box_hi_xyz, np.array([ 0.0,  0.0, -1.0])),
+    ]
+    for origin, normal in planes:
+        if len(f) == 0:
+            break
+        v, f, _ = slice_faces_plane(v, f, normal, origin)
+
+    return v, f
+
+
 def encode_fragment(fragment_mesh, fragment_position,
                     chunk_shape_xyz, grid_origin_xyz,
-                    lod=0, vertex_quantization_bits=16):
+                    lod=0, vertex_quantization_bits=16, trim=False):
     """
     Quantize and Draco-encode a single fragment.
 
@@ -139,6 +191,12 @@ def encode_fragment(fragment_mesh, fragment_position,
         fragment_position, chunk_shape_xyz, grid_origin_xyz, lod,
         vertex_quantization_bits:
             See :func:`quantize_fragment_vertices`.
+        trim:
+            If True, geometrically trim the fragment to its grid cell (via
+            :func:`trim_mesh_to_box`) before quantizing, cutting any triangles
+            that overhang the cell.  This is preferable to the coordinate
+            clipping that quantization falls back on, which merely flattens
+            overhanging triangles onto the cell face.  Requires ``trimesh``.
 
     Returns:
         Draco-encoded ``bytes``, or ``None`` if the fragment has no
@@ -147,6 +205,15 @@ def encode_fragment(fragment_mesh, fragment_position,
     vertices_xyz, faces = _as_vertices_xyz_faces(fragment_mesh)
     if len(vertices_xyz) == 0 or len(faces) == 0:
         return None
+
+    if trim:
+        cell_size = np.asarray(chunk_shape_xyz, dtype=np.float64) * (2 ** lod)
+        cell_corner = (np.asarray(grid_origin_xyz, dtype=np.float64)
+                       + np.asarray(fragment_position, dtype=np.int64) * cell_size)
+        vertices_xyz, faces = trim_mesh_to_box(
+            vertices_xyz, faces, cell_corner, cell_corner + cell_size)
+        if len(faces) == 0:
+            return None
 
     q = quantize_fragment_vertices(
         vertices_xyz, fragment_position, chunk_shape_xyz,
@@ -242,7 +309,7 @@ def write_info(output_dir, vertex_quantization_bits=16,
 
 def write_object_mesh(output_dir, segment_id, fragments,
                       chunk_shape_xyz, grid_origin_xyz,
-                      vertex_quantization_bits=16, lod_scales=None):
+                      vertex_quantization_bits=16, lod_scales=None, trim=False):
     """
     Write the ``<segment-id>`` data file and ``<segment-id>.index`` manifest
     for a single object, using a single level of detail (LOD 0).
@@ -267,6 +334,11 @@ def write_object_mesh(output_dir, segment_id, fragments,
         lod_scales:
             Optional length-1 sequence with the LOD-0 scale value.  Defaults
             to ``[1.0]``.
+        trim:
+            If True, geometrically trim each fragment to its grid cell before
+            encoding (see :func:`encode_fragment` / :func:`trim_mesh_to_box`),
+            cutting triangles that overhang the cell rather than clipping
+            their vertices onto the cell face.  Requires ``trimesh``.
 
     Returns:
         The number of fragments actually written (after skipping empties).
@@ -287,7 +359,7 @@ def write_object_mesh(output_dir, segment_id, fragments,
     for position, fragment_mesh in fragments.items():
         draco_bytes = encode_fragment(
             fragment_mesh, position, chunk_shape_xyz, grid_origin_xyz,
-            lod=0, vertex_quantization_bits=vertex_quantization_bits)
+            lod=0, vertex_quantization_bits=vertex_quantization_bits, trim=trim)
         if draco_bytes is None:
             continue
         positions.append(np.asarray(position, dtype=np.int64))

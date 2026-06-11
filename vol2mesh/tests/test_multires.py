@@ -15,6 +15,8 @@ from vol2mesh.multires import (
     read_object_mesh,
     quantize_fragment_vertices,
     zorder_positions,
+    trim_mesh_to_box,
+    encode_fragment,
 )
 
 
@@ -172,6 +174,48 @@ class TestMultires(unittest.TestCase):
                 dists = np.linalg.norm(dec_v - ev, axis=1)
                 assert dists.min() <= np.sqrt(3) * step + 1e-6, \
                     f"vertex {ev} not recovered (min dist {dists.min()})"
+
+    def test_trim_to_box(self):
+        # A cube that overhangs its cell on the high-x side. Trimming should
+        # cut the overhang at x=100 (introducing boundary vertices on that
+        # plane) and drop everything beyond, leaving the mesh within the box.
+        v_xyz, faces = _cube_mesh([50.0, 20.0, 20.0], 100.0)  # spans x in [50,150]
+        box_lo = np.array([0.0, 0.0, 0.0])
+        box_hi = np.array([100.0, 100.0, 100.0])
+
+        tv, tf = trim_mesh_to_box(v_xyz, faces, box_lo, box_hi)
+        assert len(tf) > 0
+        # Every surviving vertex is inside the box (within fp tolerance).
+        assert (tv >= box_lo - 1e-9).all() and (tv <= box_hi + 1e-9).all()
+        # The cut created vertices lying exactly on the x=100 plane...
+        assert np.isclose(tv[:, 0], 100.0).any()
+        # ...whereas clipping would instead pile many vertices onto x=100 by
+        # collapsing the overhang. Confirm trimming actually removed geometry
+        # rather than retaining all original faces.
+        assert len(tf) != len(faces)
+
+    def test_encode_fragment_trim_vs_clip(self):
+        # Same overhanging cube, encoded as a fragment with and without trim.
+        chunk = np.array([100.0, 100.0, 100.0])
+        origin = np.array([0.0, 0.0, 0.0])
+        pos = (0, 0, 0)
+        v_xyz, faces = _cube_mesh([50.0, 20.0, 20.0], 100.0)
+
+        clipped = encode_fragment((v_xyz, faces), pos, chunk, origin, trim=False)
+        trimmed = encode_fragment((v_xyz, faces), pos, chunk, origin, trim=True)
+        assert clipped is not None and trimmed is not None
+
+        import DracoPy
+        v_clip = np.asarray(DracoPy.decode(clipped).points)
+        v_trim = np.asarray(DracoPy.decode(trimmed).points)
+        max_q = (1 << 16) - 1
+        # Both keep vertices within the quantized cell range.
+        for v in (v_clip, v_trim):
+            assert (v >= 0).all() and (v <= max_q).all()
+        # Trimming changes the geometry (cut + dropped overhang), so the
+        # vertex set differs from the clip-only result.
+        assert v_trim.shape != v_clip.shape or not np.array_equal(
+            np.sort(v_trim, axis=0), np.sort(v_clip, axis=0))
 
     def test_empty_object(self):
         d = tempfile.mkdtemp()
