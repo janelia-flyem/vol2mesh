@@ -278,6 +278,52 @@ def test_smoothing_hexagon():
     assert  (mesh.vertices_zyx[3] == original_vertices_zyx[3]).all()
 
 
+def test_preserve_border():
+    """
+    Smooth an open triangulated grid patch.  The perimeter vertices each
+    touch an edge used by only one triangle, so they are 'border' vertices;
+    the rest are interior.  This patch has many interior vertices that DO
+    move under smoothing, so the test distinguishes:
+      - with preserve_border=True:  border pinned exactly, interior still moves
+      - with preserve_border=False: border moves too
+    """
+    n = 6
+    ys, xs = np.mgrid[0:n, 0:n]
+    base_zyx = np.stack([np.zeros(n*n), ys.ravel(), xs.ravel()], axis=1).astype(np.float32)
+
+    faces = []
+    for y in range(n-1):
+        for x in range(n-1):
+            a, b = y*n + x, y*n + x + 1
+            c, d = (y+1)*n + x, (y+1)*n + x + 1
+            faces += [[a, b, d], [a, d, c]]
+    faces = np.array(faces, dtype=np.uint32)
+
+    # Border detection: the patch perimeter is the outer ring of vertices.
+    border = Mesh._find_border_vertices(faces, len(base_zyx))
+    expected_border = (xs.ravel() == 0) | (xs.ravel() == n-1) | (ys.ravel() == 0) | (ys.ravel() == n-1)
+    assert border.sum() == 4*(n-1)
+    assert (border == expected_border).all()
+
+    # Perturb every vertex out of the plane so smoothing has real work to do.
+    rng = np.random.RandomState(0)
+    perturbed = base_zyx.copy()
+    perturbed[:, 0] += rng.uniform(-2, 2, size=len(base_zyx)).astype(np.float32)
+
+    # With preserve_border: border vertices are pinned exactly...
+    mesh = Mesh(perturbed.copy(), faces)
+    before = mesh.vertices_zyx.copy()
+    mesh.laplacian_smooth(5, preserve_border=True)
+    assert (mesh.vertices_zyx[border] == before[border]).all()
+    # ...but interior vertices genuinely move.
+    assert not np.isclose(mesh.vertices_zyx[~border], before[~border]).all()
+
+    # Without preserve_border, border vertices move too.
+    mesh2 = Mesh(perturbed.copy(), faces)
+    mesh2.laplacian_smooth(5, preserve_border=False)
+    assert not np.isclose(mesh2.vertices_zyx[border], before[border]).all()
+
+
 def test_smoothing_X(binary_vol_input):
     """
     This just exercises the code on our standard X-shaped
