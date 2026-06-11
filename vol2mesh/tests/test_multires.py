@@ -1,0 +1,189 @@
+import os
+import json
+import tempfile
+import unittest
+
+import numpy as np
+
+import faulthandler
+faulthandler.enable()
+
+from vol2mesh import Mesh
+from vol2mesh.multires import (
+    write_info,
+    write_object_mesh,
+    read_object_mesh,
+    quantize_fragment_vertices,
+    zorder_positions,
+)
+
+
+def _cube_mesh(corner_xyz, size):
+    """
+    A simple closed cube (8 verts, 12 triangles) with its min corner at
+    ``corner_xyz``, returned as (vertices_xyz, faces).
+    """
+    c = np.asarray(corner_xyz, dtype=np.float64)
+    offsets = np.array([
+        [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+        [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+    ], dtype=np.float64)
+    vertices_xyz = c + size * offsets
+    faces = np.array([
+        [0, 1, 2], [0, 2, 3],  # bottom
+        [4, 6, 5], [4, 7, 6],  # top
+        [0, 4, 5], [0, 5, 1],  # sides
+        [1, 5, 6], [1, 6, 2],
+        [2, 6, 7], [2, 7, 3],
+        [3, 7, 4], [3, 4, 0],
+    ], dtype=np.uint32)
+    return vertices_xyz, faces
+
+
+class TestMultires(unittest.TestCase):
+
+    def test_quantize_roundtrip(self):
+        bits = 16
+        max_q = (1 << bits) - 1
+        chunk_shape = np.array([256.0, 256.0, 256.0])
+        grid_origin = np.array([0.0, 0.0, 0.0])
+        position = np.array([3, 5, 7])
+
+        cell_corner = grid_origin + position * chunk_shape
+        # Some fractional vertices well inside the cell.
+        verts = cell_corner + np.array([
+            [127.6, 12.3, 88.05],
+            [0.0, 0.0, 0.0],
+            [256.0, 256.0, 256.0],
+            [200.123, 5.5, 255.9],
+        ])
+
+        q = quantize_fragment_vertices(verts, position, chunk_shape, grid_origin, 0, bits)
+        assert q.dtype == np.uint16
+        assert (q >= 0).all() and (q <= max_q).all()
+
+        # Dequantize and check we're within one quantization step.
+        decoded = cell_corner + chunk_shape * (q.astype(np.float64) / max_q)
+        step = chunk_shape / max_q
+        assert np.all(np.abs(decoded - verts) <= step + 1e-9)
+
+        # Exact-corner verts must land on 0 and max_q.
+        assert (q[1] == 0).all()
+        assert (q[2] == max_q).all()
+
+    def test_boundary_snap(self):
+        # A vertex a hair past the far boundary (e.g. from a halo / smoothing)
+        # should snap to max_q, not wrap or clip to something arbitrary.
+        bits = 16
+        max_q = (1 << bits) - 1
+        chunk_shape = np.array([256.0, 256.0, 256.0])
+        grid_origin = np.array([0.0, 0.0, 0.0])
+        position = np.array([0, 0, 0])
+        verts = np.array([[256.0001, -0.0001, 128.0]])
+        q = quantize_fragment_vertices(verts, position, chunk_shape, grid_origin, 0, bits)
+        assert q[0, 0] == max_q
+        assert q[0, 1] == 0
+
+    def test_zorder(self):
+        # Z-curve order interleaves bits; for a 2x2x2 block the order is the
+        # Morton sequence.
+        positions = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+            [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
+        ])
+        # Shuffle, then check zorder restores Morton order.
+        rng = np.random.RandomState(0)
+        perm = rng.permutation(len(positions))
+        shuffled = positions[perm]
+        order = zorder_positions(shuffled)
+        ordered = shuffled[order]
+
+        def morton(p):
+            x, y, z = int(p[0]), int(p[1]), int(p[2])
+            key = 0
+            for b in range(2):
+                key |= ((x >> b) & 1) << (3 * b + 0)
+                key |= ((y >> b) & 1) << (3 * b + 1)
+                key |= ((z >> b) & 1) << (3 * b + 2)
+            return key
+
+        keys = [morton(p) for p in ordered]
+        assert keys == sorted(keys), f"Not in Morton order: {keys}"
+
+    def test_write_and_read_object(self):
+        d = tempfile.mkdtemp()
+        bits = 16
+        chunk = 256.0
+        chunk_shape = np.array([chunk, chunk, chunk])
+        grid_origin = np.array([0.0, 0.0, 0.0])
+        segment_id = 12345
+
+        # Build cubes in a few grid cells. Use Mesh objects (ZYX) for one and
+        # raw (vertices_xyz, faces) for another, to exercise both inputs.
+        cells = {
+            (0, 0, 0): None,
+            (2, 1, 3): None,
+            (1, 0, 0): None,
+        }
+        expected = {}
+        for cell in cells:
+            corner = np.array(cell) * chunk
+            v_xyz, faces = _cube_mesh(corner + 30.0, 100.0)
+            expected[cell] = (v_xyz, faces)
+
+        fragments = {
+            (0, 0, 0): Mesh(expected[(0, 0, 0)][0][:, ::-1], expected[(0, 0, 0)][1]),
+            (2, 1, 3): expected[(2, 1, 3)],   # raw (vertices_xyz, faces)
+            (1, 0, 0): Mesh(expected[(1, 0, 0)][0][:, ::-1], expected[(1, 0, 0)][1]),
+        }
+
+        write_info(d, vertex_quantization_bits=bits,
+                   transform=[8, 0, 0, 0, 0, 8, 0, 0, 0, 0, 8, 0])
+        n = write_object_mesh(d, segment_id, fragments, chunk_shape, grid_origin,
+                              vertex_quantization_bits=bits)
+        assert n == 3
+
+        # info file sanity.
+        with open(f"{d}/info") as f:
+            info = json.load(f)
+        assert info["@type"] == "neuroglancer_multilod_draco"
+        assert info["vertex_quantization_bits"] == bits
+        assert len(info["transform"]) == 12
+
+        assert os.path.exists(f"{d}/{segment_id}")
+        assert os.path.exists(f"{d}/{segment_id}.index")
+
+        result = read_object_mesh(d, segment_id)
+        assert result["num_lods"] == 1
+        assert result["num_fragments_per_lod"][0] == 3
+        assert np.allclose(result["chunk_shape_xyz"], chunk_shape)
+
+        # Match each decoded fragment back to its source cell and compare
+        # vertices within one quantization step.
+        step = chunk / ((1 << bits) - 1)
+        assert len(result["fragments"]) == 3
+        for frag in result["fragments"]:
+            cell = tuple(int(c) for c in frag["position"])
+            exp_v, exp_f = expected[cell]
+            dec_v = frag["vertices_xyz"]
+            assert len(dec_v) == len(exp_v)
+            # Draco may reorder vertices; match by nearest.
+            for ev in exp_v:
+                dists = np.linalg.norm(dec_v - ev, axis=1)
+                assert dists.min() <= np.sqrt(3) * step + 1e-6, \
+                    f"vertex {ev} not recovered (min dist {dists.min()})"
+
+    def test_empty_object(self):
+        d = tempfile.mkdtemp()
+        chunk_shape = np.array([256.0, 256.0, 256.0])
+        grid_origin = np.array([0.0, 0.0, 0.0])
+        # Fragment with no faces -> skipped -> nothing written.
+        fragments = {(0, 0, 0): (np.zeros((0, 3)), np.zeros((0, 3), np.uint32))}
+        n = write_object_mesh(d, 999, fragments, chunk_shape, grid_origin)
+        assert n == 0
+        assert not os.path.exists(f"{d}/999")
+        assert not os.path.exists(f"{d}/999.index")
+
+
+if __name__ == "__main__":
+    unittest.main()
