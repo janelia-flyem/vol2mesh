@@ -21,6 +21,9 @@ from vol2mesh.multires import (
     decode_fragment,
     build_info,
     split_mesh_into_cells,
+    split_mesh_for_lod,
+    encode_multilod_object,
+    _octree_empty_placeholders,
 )
 
 
@@ -298,6 +301,104 @@ class TestMultires(unittest.TestCase):
             lo = res['grid_origin_xyz'] + frag['position'] * ch
             v = frag['vertices_xyz']
             assert (v >= lo - 1e-3).all() and (v <= lo + ch + 1e-3).all()
+
+    def test_octree_empty_placeholders(self):
+        # One occupied LOD-0 cell at (5,5,5); its ancestors must be filled.
+        occupied = {0: {(5, 5, 5)}, 1: set(), 2: set()}
+        empties = _octree_empty_placeholders(occupied, 3)
+        assert empties[1] == {(2, 2, 2)}   # parent of (5,5,5)
+        assert empties[2] == {(1, 1, 1)}   # grandparent
+        # A coarse cell that is already occupied is not added as an empty.
+        occupied2 = {0: {(2, 2, 2)}, 1: {(1, 1, 1)}}
+        empties2 = _octree_empty_placeholders(occupied2, 2)
+        assert empties2[1] == set()
+
+    @staticmethod
+    def _parse_positions_by_lod(index_bytes):
+        buf = index_bytes
+        pos = 0
+
+        def take(dt, c):
+            nonlocal pos
+            a = np.frombuffer(buf, dtype=dt, count=c, offset=pos)
+            pos += a.nbytes
+            return a
+
+        take("<f4", 3); take("<f4", 3)
+        num_lods = int(take("<u4", 1)[0])
+        take("<f4", num_lods); take("<f4", num_lods * 3)
+        nfr = take("<u4", num_lods).astype(int)
+        by_lod = {}
+        for lod in range(num_lods):
+            n = int(nfr[lod])
+            p = take("<u4", n * 3).reshape(3, n).T
+            take("<u4", n)  # offsets
+            by_lod[lod] = {tuple(int(c) for c in row) for row in p}
+        return num_lods, by_lod
+
+    def test_multilod_roundtrip_partition_and_octree(self):
+        # Build a 3-LOD object from a sphere, with small cells so each LOD has
+        # several fragments and a real octree.
+        N = 128
+        zz, yy, xx = np.ogrid[:N, :N, :N]
+        c = N / 2
+        vol = ((zz - c)**2 + (yy - c)**2 + (xx - c)**2) <= 50**2
+        mesh = Mesh.from_binary_vol(vol, method='skimage')
+
+        chunk = np.array([32.0, 32.0, 32.0])
+        num_lods = 3
+        fragments_by_lod = {}
+        current = mesh
+        for lod in range(num_lods):
+            if lod > 0:
+                current = Mesh(current.vertices_zyx.copy(), current.faces.copy())
+                current.simplify(0.5, preserve_border=True)
+            fragments_by_lod[lod] = split_mesh_for_lod(current, chunk, lod)
+
+        data, index, nfrags = encode_multilod_object(fragments_by_lod, chunk, [0, 0, 0])
+        assert len(nfrags) == 3 and all(n > 0 for n in nfrags)
+
+        # Octree ancestor-closure: every position at lod l has its parent at l+1.
+        nl, pos_by_lod = self._parse_positions_by_lod(index)
+        assert nl == 3
+        for lod in range(num_lods - 1):
+            for (x, y, z) in pos_by_lod[lod]:
+                assert (x // 2, y // 2, z // 2) in pos_by_lod[lod + 1], \
+                    f"missing parent of {(x, y, z)} at lod {lod + 1}"
+
+        # Round-trip and validate per-fragment invariants.
+        d = tempfile.mkdtemp()
+        write_info(d, vertex_quantization_bits=16)
+        with open(f"{d}/3", "wb") as fp:
+            fp.write(data)
+        with open(f"{d}/3.index", "wb") as fp:
+            fp.write(index)
+        res = read_object_mesh(d, 3)
+        assert res['num_lods'] == 3
+
+        max_q = (1 << 16) - 1
+        for frag in res['fragments']:
+            lod = frag['lod']
+            position = frag['position']
+            cell_size = chunk * (2 ** lod)
+            lo = position * cell_size      # grid_origin == 0
+            v = frag['vertices_xyz']
+            faces = frag['faces']
+            step = cell_size / max_q
+
+            # In-cell.
+            assert (v >= lo - 1e-3).all() and (v <= lo + cell_size + 1e-3).all()
+
+            # 2x2x2 partition: for lod>0, no triangle may straddle a mid-plane.
+            if lod > 0 and len(faces):
+                mid = lo + cell_size / 2.0
+                tri = v[faces]  # (T, 3, 3)
+                for ax in range(3):
+                    rel = tri[:, :, ax] - mid[ax]
+                    below = (rel < -step[ax]).any(axis=1)
+                    above = (rel > step[ax]).any(axis=1)
+                    assert not (below & above).any(), \
+                        f"triangle crosses mid-plane (axis {ax}, lod {lod})"
 
     def test_empty_object(self):
         d = tempfile.mkdtemp()
