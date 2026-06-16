@@ -529,7 +529,9 @@ def _write_manifest_and_data(chunk_shape_xyz, grid_origin_xyz, lod_scales, per_l
         # fragment_offsets: byte size of each fragment, in the same order.
         index_parts.append(offsets.astype("<u4").tobytes())
 
-    return data_bytes, b''.join(index_parts), list(num_fragments_per_lod)
+    # .tolist() yields native Python ints (not numpy.uint32, which is not
+    # JSON-serializable and would break callers that record this in metadata).
+    return data_bytes, b''.join(index_parts), num_fragments_per_lod.tolist()
 
 
 def _octree_empty_placeholders(occupied_by_lod, num_lods):
