@@ -877,7 +877,41 @@ class Mesh:
         self.recompute_normals(True)
 
 
-    def laplacian_smooth(self, iterations=1, constrain_exterior=None, constraint_mode='fixed'):
+    @staticmethod
+    def _find_border_vertices(faces, num_vertices):
+        """
+        Identify the vertices that lie on an open boundary of the mesh,
+        i.e. any vertex touching an edge that belongs to only one triangle.
+
+        This is purely topological (independent of vertex coordinates,
+        winding, or scale): an interior edge is shared by two triangles, a
+        boundary edge by exactly one.
+
+        Returns:
+            A boolean mask of length num_vertices, True for border vertices.
+        """
+        mask = np.zeros(num_vertices, dtype=bool)
+        if len(faces) == 0:
+            return mask
+
+        # The three edges of every triangle, canonicalized so {a,b} == {b,a}.
+        e = np.concatenate([faces[:, (0, 1)], faces[:, (1, 2)], faces[:, (2, 0)]])
+        lo = np.minimum(e[:, 0], e[:, 1]).astype(np.int64)
+        hi = np.maximum(e[:, 0], e[:, 1]).astype(np.int64)
+
+        # Pack each undirected edge into a single int64 so the dedup+count is
+        # a 1-D sort rather than a 2-D lexsort.
+        key = lo * np.int64(num_vertices) + hi
+        uniq, counts = np.unique(key, return_counts=True)
+        border_key = uniq[counts == 1]
+
+        border_verts = np.unique(np.concatenate([border_key // num_vertices,
+                                                 border_key % num_vertices]))
+        mask[border_verts] = True
+        return mask
+
+
+    def laplacian_smooth(self, iterations=1, constrain_exterior=None, constraint_mode='fixed', preserve_border=False):
         """
         Smooth the mesh in-place.
 
@@ -894,6 +928,24 @@ class Mesh:
             iterations:
                 How many passes to take over the data.
                 More iterations results in a smoother mesh, but more shrinkage (and more CPU time).
+
+            constrain_exterior:
+                If given, vertices on (or beyond) the given bounding box are held fixed.
+                Pass ``True`` to use the mesh's own ``box``, or pass an explicit (2,3) box.
+                See ``constraint_mode``.
+
+            constraint_mode:
+                How ``constrain_exterior`` freezes vertices:
+                - 'fixed': if any coordinate of a vertex is on the boundary, freeze the whole vertex.
+                - 'planar': freeze only the individual coordinate(s) that lie on the boundary.
+
+            preserve_border:
+                If True, hold the mesh's open-boundary ("border") vertices fixed during smoothing.
+                A border vertex is one touching an edge used by only a single triangle.
+                Unlike ``constrain_exterior``, this is purely topological -- it requires no
+                knowledge of the bounding box or scale -- so it reliably pins the open edges of
+                an "open" mesh (e.g. a chunk/fragment cut out of a larger volume) regardless of
+                where those edges happen to lie in space.
 
         TODO: Variations of this technique can give refined results.
             - Try weighting the influence of each neighbor by it's distance to the center vertex.
@@ -931,6 +983,10 @@ class Mesh:
         # How many neighbors for each vertex == how many times it is mentioned in the edge list
         neighbor_counts = np.bincount(edges.ravel(), minlength=len(self.vertices_zyx))
 
+        border_mask = None
+        if preserve_border:
+            border_mask = self._find_border_vertices(self.faces, len(self.vertices_zyx))
+
         if constrain_exterior is not None:
             frozen_coords = (self.vertices_zyx <= constrain_exterior[0])
             frozen_coords |= (self.vertices_zyx >= constrain_exterior[1]-1)
@@ -961,6 +1017,9 @@ class Mesh:
 
             if constrain_exterior is not None:
                 new_vertices_zyx[frozen_coords] = self.vertices_zyx[frozen_coords]
+
+            if border_mask is not None:
+                new_vertices_zyx[border_mask] = self.vertices_zyx[border_mask]
 
             # Swap (save RAM allocation overhead by reusing the new_vertices_zyx array between iterations)
             self.vertices_zyx, new_vertices_zyx = new_vertices_zyx, self.vertices_zyx
