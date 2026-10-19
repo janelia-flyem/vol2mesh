@@ -14,15 +14,10 @@ import numpy as np
 import lz4.frame
 from scipy.ndimage import find_objects
 import pyfqmr
+import DracoPy
 from vol2mesh.util import compute_nonzero_box, extract_subvol, has_nonzero_edges
 
 PYFQMR_LOCK = threading.Lock()
-
-try:
-    from dvidutils import encode_faces_to_drc_bytes, decode_drc_bytes_to_faces
-    _dvidutils_available = True
-except ImportError:
-    _dvidutils_available = False
 
 from .normals import compute_face_normals, compute_vertex_normals
 from .obj_utils import write_obj, read_obj
@@ -32,6 +27,58 @@ from .io_utils import stdout_redirected
 logger = logging.getLogger(__name__)
 
 DRACO_USE_PIPE = False
+
+# Draco encoder settings (defaults from the draco_encoder command-line tool)
+DRACO_COMPRESSION_LEVEL = 7
+DRACO_POSITION_QUANTIZATION_BITS = 14
+DRACO_NORMAL_QUANTIZATION_BITS = 10
+
+
+def encode_faces_to_drc_bytes(vertices_xyz, normals_xyz, faces):
+    """
+    Encode the given mesh arrays (in XYZ order) to draco bytes.
+    If faces is empty, an empty buffer is returned.
+    """
+    if len(faces) == 0:
+        return b''
+
+    normals = None
+    if len(normals_xyz) > 0:
+        # DracoPy requires float64 normals
+        normals = np.asarray(normals_xyz, dtype=np.float64)
+
+    return DracoPy.encode(
+        np.asarray(vertices_xyz, dtype=np.float32),
+        np.asarray(faces, dtype=np.uint32),
+        quantization_bits=DRACO_POSITION_QUANTIZATION_BITS,
+        compression_level=DRACO_COMPRESSION_LEVEL,
+        normals=normals,
+        normal_quantization_bits=(DRACO_NORMAL_QUANTIZATION_BITS if normals is not None else None)
+    )
+
+
+def decode_drc_bytes_to_faces(drc_bytes):
+    """
+    Decode draco bytes into (vertices_xyz, normals_xyz, faces).
+    If drc_bytes is empty, empty arrays are returned.
+    """
+    if len(drc_bytes) == 0:
+        return (np.zeros((0,3), np.float32),
+                np.zeros((0,3), np.float32),
+                np.zeros((0,3), np.uint32))
+
+    mesh = DracoPy.decode(drc_bytes)
+    if not isinstance(mesh, DracoPy.DracoMesh):
+        raise RuntimeError("Buffer does not appear to be a mesh file. (Is it a pointcloud?)")
+
+    vertices_xyz = np.asarray(mesh.points, dtype=np.float32).reshape(-1, 3)
+    faces = np.asarray(mesh.faces, dtype=np.uint32).reshape(-1, 3)
+    if mesh.normals is None:
+        normals_xyz = np.zeros((0,3), np.float32)
+    else:
+        normals_xyz = np.asarray(mesh.normals, dtype=np.float32).reshape(-1, 3)
+    return vertices_xyz, normals_xyz, faces
+
 
 class Mesh:
     """
@@ -235,8 +282,6 @@ class Mesh:
             return Mesh(vertices_zyx, faces, normals_zyx)
 
         elif fmt == 'drc':
-            assert _dvidutils_available, \
-                "Can't read draco meshes if dvidutils isn't installed"
 
             vertices_xyz, normals_xyz, faces = decode_drc_bytes_to_faces(serialized_bytes)
             vertices_zyx = vertices_xyz[:,::-1]
@@ -536,8 +581,6 @@ class Mesh:
     
 
     def _compress_as_draco(self):
-        assert _dvidutils_available, \
-            "Can't use draco compression if dvidutils isn't installed"
         if self._draco_bytes is None:
             self._uncompress() # Ensure not currently compressed as lz4
             self._draco_bytes = encode_faces_to_drc_bytes(self._vertices_zyx[:,::-1], self._normals_zyx[:,::-1], self._faces)
@@ -582,8 +625,6 @@ class Mesh:
     
 
     def _uncompress_from_draco(self):
-        assert _dvidutils_available, \
-            "Can't decode from draco if dvidutils isn't installed"
         vertices_xyz, normals_xyz, self._faces = decode_drc_bytes_to_faces(self._draco_bytes)
         self._vertices_zyx = vertices_xyz[:, ::-1]
         self._normals_zyx = normals_xyz[:, ::-1]
@@ -1069,8 +1110,6 @@ class Mesh:
                 return write_obj(self.vertices_zyx[:,::-1], self.faces, self.normals_zyx[:,::-1])
 
         elif fmt == 'drc':
-            assert _dvidutils_available, \
-                "Can't use draco compression if dvidutils isn't installed"
             draco_bytes = self._draco_bytes
             if draco_bytes is None:
                 if self.normals_zyx.shape[0] == 0:
