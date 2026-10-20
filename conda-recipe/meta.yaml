@@ -45,11 +45,15 @@ requirements:
     # It's an optional dependency (late import) in vol2mesh anyway.
     #- openmesh-python
 
+    # Optional dependency, used in multires.py
+    - trimesh
+
 test:
   imports:
     - vol2mesh
   requires:
     - pytest
+    - trimesh
   commands:
     - pytest -s --tb=native --pyargs vol2mesh.tests
 
