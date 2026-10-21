@@ -495,6 +495,34 @@ def test_split_mesh_into_cells_matches_reference():
             assert np.array_equal(actual[cell].faces, expected[cell].faces), cell
 
 
+def test_encode_fragment_omits_fragments_that_collapse_when_quantized():
+    """
+    A tiny sliver of a triangle collapses to a point when quantized.  Draco refuses to
+    encode a mesh whose triangles are ALL degenerate, so such fragments must be omitted.
+    """
+    import DracoPy
+    chunk, origin = [64.0, 64.0, 64.0], [0, 0, 0]
+    step = 64.0 / (2**16 - 1)
+    sliver_v = np.array([[10.0, 10.0, 10.0], [10.0 + step / 10, 10.0, 10.0], [10.0, 10.0 + step / 10, 10.0]])
+    sliver_f = np.array([[0, 1, 2]], np.uint32)
+
+    for lod in (0, 1):
+        assert encode_fragment((sliver_v, sliver_f), (0, 0, 0), chunk, origin, lod=lod) is None
+
+    # A fragment with at least one real triangle is still encoded (Draco drops the degenerate ones).
+    good_v, good_f = _cube_mesh([8, 8, 8], 16)
+    v = np.concatenate([good_v, sliver_v])
+    f = np.concatenate([good_f, sliver_f + len(good_v)])
+    b = encode_fragment((v, f), (0, 0, 0), chunk, origin)
+    assert b is not None
+    assert len(DracoPy.decode(b).faces) == len(good_f)
+
+    # And encode_multilod_object() simply skips the collapsed fragment.
+    data, index, n = encode_multilod_object(
+        {0: {(0, 0, 0): (good_v, good_f), (1, 0, 0): (sliver_v + [64, 0, 0], sliver_f)}}, chunk, origin)
+    assert n == [1]
+
+
 def test_split_mesh_into_cells_empty():
     empty = Mesh(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32))
     assert split_mesh_into_cells(empty, [64.0, 64.0, 64.0]) == {}

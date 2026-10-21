@@ -229,6 +229,19 @@ def encode_fragment(fragment_mesh, fragment_position,
         vertices_xyz, fragment_position, chunk_shape_xyz,
         grid_origin_xyz, lod, vertex_quantization_bits)
 
+    # Draco discards degenerate triangles (with two coincident vertices, after quantization),
+    # and refuses to encode a mesh in which ALL triangles are degenerate ("Invalid mesh").
+    # That can happen for tiny fragments (e.g. slivers left after trimming), which have no
+    # geometry after quantization, so we omit them.
+    fq = q[np.asarray(faces)]
+    degenerate = (
+        (fq[:, 0] == fq[:, 1]).all(axis=1)
+        | (fq[:, 1] == fq[:, 2]).all(axis=1)
+        | (fq[:, 0] == fq[:, 2]).all(axis=1)
+    )
+    if degenerate.all():
+        return None
+
     # Pass integer positions directly: neuroglancer's multilod_draco format
     # requires an integer position attribute and does NOT support Draco's
     # built-in quantization, so we must not pass quantization_* args here.
