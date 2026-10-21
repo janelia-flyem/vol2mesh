@@ -300,35 +300,69 @@ def split_mesh_into_cells(mesh, cell_size_zyx):
     """
     from vol2mesh import Mesh
 
-    v = np.asarray(mesh.vertices_zyx, dtype=np.float64)
-    f = np.asarray(mesh.faces)
+    # Note: This function is used on entire (large) body meshes, so it avoids
+    # creating large temporary arrays.  In particular, it doesn't make a float64
+    # copy of all vertices or an (F, 3, 3) array of face vertex coordinates.
+    v = mesh.vertices_zyx
+    f = mesh.faces
     if len(f) == 0:
         return {}
 
     cell_size_zyx = np.asarray(cell_size_zyx, dtype=np.float64)
-    fv = v[f]                                                       # (F, 3, 3) zyx
-    lo = np.floor(fv.min(axis=1) / cell_size_zyx).astype(np.int64)  # (F, 3) cell index
-    hi = np.floor(fv.max(axis=1) / cell_size_zyx).astype(np.int64)
 
-    # Build (cell_index, face_index) pairs. Single-cell faces (the common
-    # case) are assigned in bulk; the few boundary-straddling faces are
-    # enumerated over their (small) cell ranges.
+    # Each vertex's cell index, computed in float64 (in batches, to limit the
+    # size of the temporary float64 arrays).
+    vertex_cells = np.empty(v.shape, dtype=np.int32)
+    batch_size = 1_000_000
+    for start in range(0, len(v), batch_size):
+        batch = v[start:start + batch_size].astype(np.float64)
+        vertex_cells[start:start + batch_size] = np.floor(batch / cell_size_zyx)
+
+    # Since floor() is monotonic, the range of cells overlapped by a face's
+    # bounding box is given by the min/max cell index of its vertices.
+    lo = vertex_cells[f[:, 0]]                                      # (F, 3) cell index
+    hi = lo.copy()
+    for i in (1, 2):
+        c = vertex_cells[f[:, i]]
+        np.minimum(lo, c, out=lo)
+        np.maximum(hi, c, out=hi)
+    del c, vertex_cells
+
+    # Build (cell_index, face_index) pairs.  Single-cell faces (the common case)
+    # are assigned in bulk.  Boundary-straddling faces get one pair for each of
+    # the cells in their (small) cell ranges.
     straddles = (lo != hi).any(axis=1)
-    cell_rows = [lo[~straddles]]
-    face_rows = [np.flatnonzero(~straddles)]
-    for i in np.flatnonzero(straddles):
-        for cz in range(lo[i, 0], hi[i, 0] + 1):
-            for cy in range(lo[i, 1], hi[i, 1] + 1):
-                for cx in range(lo[i, 2], hi[i, 2] + 1):
-                    cell_rows.append(np.array([[cz, cy, cx]], dtype=np.int64))
-                    face_rows.append(np.array([i]))
+    single = ~straddles
+    cell_rows = [lo[single]]
+    face_rows = [np.flatnonzero(single)]
+
+    if straddles.any():
+        s_faces = np.flatnonzero(straddles)
+        s_lo = lo[s_faces]
+        s_ext = hi[s_faces] - s_lo + 1                              # (S, 3) cells per axis
+        s_counts = s_ext.prod(axis=1)                               # cells per face
+
+        # For each (face, cell) pair, the cell's offset within the face's range.
+        reps = np.repeat(np.arange(len(s_faces)), s_counts)
+        k = np.arange(len(reps)) - np.repeat(np.cumsum(s_counts) - s_counts, s_counts)
+        ext_y = s_ext[reps, 1]
+        ext_x = s_ext[reps, 2]
+        offsets = np.stack((k // (ext_y * ext_x), (k // ext_x) % ext_y, k % ext_x), axis=1)
+
+        cell_rows.append(s_lo[reps] + offsets.astype(np.int32))
+        face_rows.append(s_faces[reps])
+        del s_faces, s_lo, s_ext, s_counts, reps, k, ext_y, ext_x, offsets
+    del lo, hi, straddles, single
+
     cells = np.concatenate(cell_rows)                               # (P, 3)
     face_ids = np.concatenate(face_rows)                            # (P,)
+    del cell_rows, face_rows
 
     # Group face indices by cell.
     order = np.lexsort(cells.T)
     cells = cells[order]
     face_ids = face_ids[order]
+    del order
     group_starts = np.r_[0,
                          1 + np.flatnonzero((cells[1:] != cells[:-1]).any(axis=1)),
                          len(cells)]
@@ -338,7 +372,7 @@ def split_mesh_into_cells(mesh, cell_size_zyx):
         cz, cy, cx = (int(c) for c in cells[s])
         sub_faces = f[face_ids[s:e]]
         used = np.unique(sub_faces)
-        sub_v = v[used]
+        sub_v = v[used].astype(np.float64)
         sub_f = np.searchsorted(used, sub_faces)
         cell_lo = np.array([cz, cy, cx], dtype=np.float64) * cell_size_zyx
         tv, tf = trim_mesh_to_box(sub_v, sub_f, cell_lo, cell_lo + cell_size_zyx)

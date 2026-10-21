@@ -412,5 +412,93 @@ class TestMultires(unittest.TestCase):
         assert not os.path.exists(f"{d}/999.index")
 
 
+def _split_mesh_into_cells_reference(mesh, cell_size_zyx):
+    """
+    The original (simple, but memory-hungry) implementation of split_mesh_into_cells(),
+    against which the optimized implementation is checked.
+    """
+    v = np.asarray(mesh.vertices_zyx, dtype=np.float64)
+    f = np.asarray(mesh.faces)
+    if len(f) == 0:
+        return {}
+
+    cell_size_zyx = np.asarray(cell_size_zyx, dtype=np.float64)
+    fv = v[f]
+    lo = np.floor(fv.min(axis=1) / cell_size_zyx).astype(np.int64)
+    hi = np.floor(fv.max(axis=1) / cell_size_zyx).astype(np.int64)
+
+    straddles = (lo != hi).any(axis=1)
+    cell_rows = [lo[~straddles]]
+    face_rows = [np.flatnonzero(~straddles)]
+    for i in np.flatnonzero(straddles):
+        for cz in range(lo[i, 0], hi[i, 0] + 1):
+            for cy in range(lo[i, 1], hi[i, 1] + 1):
+                for cx in range(lo[i, 2], hi[i, 2] + 1):
+                    cell_rows.append(np.array([[cz, cy, cx]], dtype=np.int64))
+                    face_rows.append(np.array([i]))
+    cells = np.concatenate(cell_rows)
+    face_ids = np.concatenate(face_rows)
+
+    order = np.lexsort(cells.T)
+    cells = cells[order]
+    face_ids = face_ids[order]
+    group_starts = np.r_[0,
+                         1 + np.flatnonzero((cells[1:] != cells[:-1]).any(axis=1)),
+                         len(cells)]
+
+    fragments = {}
+    for s, e in zip(group_starts[:-1], group_starts[1:]):
+        cz, cy, cx = (int(c) for c in cells[s])
+        sub_faces = f[face_ids[s:e]]
+        used = np.unique(sub_faces)
+        sub_v = v[used]
+        sub_f = np.searchsorted(used, sub_faces)
+        cell_lo = np.array([cz, cy, cx], dtype=np.float64) * cell_size_zyx
+        tv, tf = trim_mesh_to_box(sub_v, sub_f, cell_lo, cell_lo + cell_size_zyx)
+        if len(tf) == 0:
+            continue
+        fragments[(cx, cy, cz)] = Mesh(tv, tf)
+    return fragments
+
+
+def _random_triangles(n, scale, offset, seed):
+    """Random (often large, cell-spanning) triangles."""
+    rng = np.random.default_rng(seed)
+    v = rng.uniform(0, scale, size=(3 * n, 3)) + offset
+    f = np.arange(3 * n, dtype=np.uint32).reshape(-1, 3)
+    return Mesh(v, f)
+
+
+def _sphere_mesh(N=96, radius=30):
+    zz, yy, xx = np.ogrid[:N, :N, :N]
+    c = N / 2
+    vol = ((zz - c)**2 + (yy - c)**2 + (xx - c)**2) <= radius**2
+    return Mesh.from_binary_vol(vol, method='skimage')
+
+
+def test_split_mesh_into_cells_matches_reference():
+    """The optimized split_mesh_into_cells() produces exactly the same fragments as the original."""
+    cases = [
+        (_sphere_mesh(), [64.0, 64.0, 64.0]),
+        (_sphere_mesh(), [32.0, 16.0, 48.0]),
+        (_sphere_mesh(), [7.0, 10.5, 13.25]),                            # non-power-of-two cell sizes
+        (_random_triangles(200, 100.0, 0.0, seed=0), [10.0, 20.0, 30.0]),  # faces spanning many cells
+        (_random_triangles(200, 100.0, -50.0, seed=1), [16.0, 16.0, 16.0]),  # negative coordinates
+    ]
+    for mesh, cell_size_zyx in cases:
+        expected = _split_mesh_into_cells_reference(mesh, cell_size_zyx)
+        actual = split_mesh_into_cells(mesh, cell_size_zyx)
+        assert len(expected) > 1
+        assert actual.keys() == expected.keys()
+        for cell in expected:
+            assert np.array_equal(actual[cell].vertices_zyx, expected[cell].vertices_zyx), cell
+            assert np.array_equal(actual[cell].faces, expected[cell].faces), cell
+
+
+def test_split_mesh_into_cells_empty():
+    empty = Mesh(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32))
+    assert split_mesh_into_cells(empty, [64.0, 64.0, 64.0]) == {}
+
+
 if __name__ == "__main__":
     unittest.main()
