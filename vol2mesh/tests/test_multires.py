@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import pytest
 
 import faulthandler
 faulthandler.enable()
@@ -24,6 +25,8 @@ from vol2mesh.multires import (
     split_mesh_for_lod,
     encode_multilod_object,
     _octree_empty_placeholders,
+    parse_manifest,
+    partition_fragment_by_cells,
 )
 
 
@@ -526,6 +529,57 @@ def test_encode_fragment_omits_fragments_that_collapse_when_quantized():
 def test_split_mesh_into_cells_empty():
     empty = Mesh(np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint32))
     assert split_mesh_into_cells(empty, [64.0, 64.0, 64.0]) == {}
+
+
+def test_parse_manifest():
+    chunk = np.array([64.0, 64.0, 64.0])
+    origin = np.array([0.0, 0.0, 0.0])
+    fragments_by_lod = {
+        0: {(0, 0, 0): _cube_mesh([8, 8, 8], 40), (3, 1, 2): _cube_mesh([200, 72, 136], 40)},
+        1: {(0, 0, 0): _cube_mesh([8, 8, 8], 40)},
+    }
+    data, index, nfrag = encode_multilod_object(fragments_by_lod, chunk, origin)
+    m = parse_manifest(index)
+    assert m["num_lods"] == 2
+    assert (m["chunk_shape_xyz"] == chunk).all()
+    assert m["num_fragments_per_lod"].tolist() == nfrag
+
+    # LOD 1 includes a placeholder for the (1,0,1) parent of the (3,1,2) LOD-0 fragment.
+    assert {tuple(int(c) for c in p) for p in m["lods"][1]["positions"]} == {(0, 0, 0), (1, 0, 1)}
+
+    # The offsets and sizes locate each fragment within the data.
+    end = 0
+    for lod, frags in enumerate(m["lods"]):
+        for p, size, offset in zip(frags["positions"], frags["sizes"], frags["offsets"]):
+            assert offset == end
+            end += size
+            if size:
+                _v, f = decode_fragment(data[offset:offset + size], p, chunk, origin, lod=lod)
+                assert len(f) == 12
+    assert end == len(data)
+
+    with pytest.raises(ValueError):
+        parse_manifest(index + b"x")
+
+
+def test_partition_fragment_by_cells():
+    cell = np.array([64.0, 64.0, 64.0])
+    pieces = {(0, 0, 0): _cube_mesh([8, 8, 8], 40), (1, 0, 1): _cube_mesh([72, 8, 72], 40)}
+
+    # Concatenate the pieces (as in an LOD-1 fragment) and partition them again.
+    vs, fs, offset = [], [], 0
+    for v, f in pieces.values():
+        vs.append(v)
+        fs.append(f + offset)
+        offset += len(v)
+    result = partition_fragment_by_cells(np.concatenate(vs), np.concatenate(fs), cell)
+
+    assert set(result) == set(pieces)
+    for cell_pos, (v, f) in pieces.items():
+        rv, rf = result[cell_pos]
+        assert (rv[rf] == v[f]).all()
+
+    assert partition_fragment_by_cells(np.zeros((0, 3)), np.zeros((0, 3), int), cell) == {}
 
 
 if __name__ == "__main__":
