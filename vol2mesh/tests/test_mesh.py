@@ -613,6 +613,92 @@ def test_mismatches(tiny_meshes):
         assert False, "Expected a RuntimeError, but did not see one."
 
 
+def _sphere_mesh(radius=40, box_size=100):
+    zz, yy, xx = np.ogrid[:box_size, :box_size, :box_size]
+    c = box_size // 2
+    vol = ((zz - c)**2 + (yy - c)**2 + (xx - c)**2) <= radius**2
+    mesh = Mesh.from_binary_vol(vol, [(0, 0, 0), vol.shape], method='skimage')
+    mesh.laplacian_smooth(2)
+    return mesh
+
+
+def test_simplify_to_error_schedule():
+    from vol2mesh.mesh import _error_threshold_schedule
+    for max_error in [1e-3, 0.1, 1.0, 8.0, 80.0, 1e4]:
+        n, alpha = _error_threshold_schedule(max_error)
+        # The final iteration's threshold is exactly max_error...
+        assert np.isclose(alpha * (n - 1 + 3)**7, max_error)
+        # ...and the threshold rises at the same rate as with pyfqmr's default alpha.
+        if n > 2:
+            assert 0.5e-9 < alpha < 2e-9
+
+
+def test_simplify_to_error():
+    mesh = _sphere_mesh()
+    orig_faces = len(mesh.faces)
+
+    face_counts = []
+    for max_error in [0.1, 1.0, 10.0, 100.0]:
+        m = copy.deepcopy(mesh)
+        m.simplify_to_error(max_error)
+        face_counts.append(len(m.faces))
+        assert len(m.vertices_zyx) == len(m.normals_zyx)
+        assert m.faces.max() < len(m.vertices_zyx)
+
+        # The vertices remain close to the original surface
+        # (within roughly sqrt(max_error), the RMS distance to the original face planes).
+        r = np.linalg.norm(m.vertices_zyx - 50, axis=1)
+        assert np.abs(r - 40).max() < 2 + 2 * np.sqrt(max_error)
+
+    assert orig_faces > face_counts[0] > face_counts[1] > face_counts[2] > face_counts[3] > 0
+
+    # No-op for no error
+    m = copy.deepcopy(mesh)
+    m.simplify_to_error(0)
+    assert len(m.faces) == orig_faces
+
+    empty = Mesh(np.zeros((0, 3), np.float32), np.zeros((0, 3), int))
+    empty.simplify_to_error(10.0)
+    assert len(empty.faces) == 0
+
+
+def test_simplify_to_error_pieces_match_whole():
+    """
+    Decimating separate pieces of a mesh to the same error yields about as many faces as
+    decimating the whole thing (which is why per-chunk decimation can replace body decimation).
+    """
+    mesh = _sphere_mesh()
+
+    # Two disjoint copies of the sphere
+    other = copy.deepcopy(mesh)
+    other.vertices_zyx[:, 2] += 200
+    both = concatenate_meshes([mesh, other])
+
+    whole = copy.deepcopy(both)
+    whole.simplify_to_error(10.0)
+
+    piece = copy.deepcopy(mesh)
+    piece.simplify_to_error(10.0)
+    assert abs(len(whole.faces) - 2 * len(piece.faces)) <= 0.05 * len(whole.faces)
+
+
+def test_simplify_to_error_preserves_border():
+    mesh = _sphere_mesh()
+
+    # Cut the sphere open: drop the faces with any vertex above the equator.
+    keep = (mesh.vertices_zyx[mesh.faces][..., 0] < 50).all(axis=1)
+    mesh = Mesh(mesh.vertices_zyx, mesh.faces[keep])
+
+    def border_vertices(m):
+        edges = np.sort(np.concatenate([m.faces[:, [0, 1]], m.faces[:, [1, 2]], m.faces[:, [2, 0]]]), axis=1)
+        edges, counts = np.unique(edges, axis=0, return_counts=True)
+        return {tuple(v) for v in m.vertices_zyx[np.unique(edges[counts == 1])]}
+
+    before = border_vertices(mesh)
+    mesh.simplify_to_error(100.0)
+    assert border_vertices(mesh) == before
+
+
 if __name__ == "__main__":
     args = ['-s', '--tb=native', '--pyargs', __file__]
     #args += ['-k' 'normals_implementations']

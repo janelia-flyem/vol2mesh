@@ -831,7 +831,44 @@ class Mesh:
             self.normals_zyx = compute_vertex_normals(self.vertices_zyx, self.faces, face_normals=face_normals)
 
     def simplify(self, fraction, **kwargs):
+        """
+        Simplify this mesh in-place (via pyfqmr), to the given fraction of its faces.
+        Extra kwargs are passed to ``pyfqmr.Simplify.simplify_mesh()``.
+        """
         if fraction is None or fraction == 1.0:
+            return
+        self._simplify(int(fraction * len(self.faces)), **kwargs)
+
+    def simplify_to_error(self, max_error, preserve_border=True, aggressiveness=7.0, K=3):
+        """
+        Simplify this mesh in-place (via pyfqmr), until no more edges can be collapsed
+        without exceeding the given (quadric) error, regardless of the resulting face count.
+
+        The error of collapsing an edge is pyfqmr's quadric error metric:
+        the sum of the squared distances from the merged vertex to the planes of
+        the original faces it replaces, i.e. it is in squared units of the
+        vertex coordinates.  Therefore, decimating independent pieces of a mesh
+        (e.g. chunks) with the same max_error yields roughly the same result as
+        decimating the whole mesh (to the corresponding face count) at once.
+
+        pyfqmr's (non-lossless) algorithm collapses edges in a series of passes,
+        collapsing any edge whose error is below a threshold which rises with each pass:
+
+            threshold = alpha * (iteration + K)**aggressiveness
+
+        We choose alpha and the number of passes so that the final pass's threshold
+        is exactly max_error, with the same threshold growth rate as pyfqmr's defaults.
+        (pyfqmr's 'lossless' mode uses a fixed threshold instead, which collapses
+        edges in a less favorable order.)
+        """
+        if not max_error or max_error <= 0:
+            return
+        max_iterations, alpha = _error_threshold_schedule(max_error, aggressiveness, K)
+        self._simplify(0, max_iterations=max_iterations, alpha=alpha, K=K,
+                       aggressiveness=aggressiveness, preserve_border=preserve_border)
+
+    def _simplify(self, target_face_count, **kwargs):
+        if len(self.faces) == 0:
             return
 
         # Claude discovered that pyfqmr is not thread-safe (as of v0.3.0),
@@ -839,12 +876,12 @@ class Mesh:
         with PYFQMR_LOCK:
             simplifier = pyfqmr.Simplify()
             simplifier.setMesh(self.vertices_zyx, self.faces)
-            target_face_count = int(fraction * len(self.faces))
 
             _kwargs = {
                 'aggressiveness': 7,
                 'preserve_border': True,
-                'lossless': False
+                'lossless': False,
+                'verbose': False,
             }
             _kwargs.update(kwargs)
 
@@ -1249,3 +1286,15 @@ def _verify_concatenate_inputs(meshes, vertex_counts):
         msg += f"Wrote first matching mesh to {output_path} (host: {hostname})\n"
     
     raise RuntimeError(msg)
+
+
+def _error_threshold_schedule(max_error, aggressiveness=7.0, K=3, default_alpha=1e-9):
+    """
+    For Mesh.simplify_to_error(): Return (max_iterations, alpha) for which pyfqmr's
+    edge-collapse threshold, alpha * (iteration + K)**aggressiveness, rises at the same
+    rate as it does with pyfqmr's default alpha, and is exactly max_error in the final iteration.
+    """
+    n = int(round((max_error / default_alpha) ** (1 / aggressiveness))) - K + 1
+    n = max(n, 2)
+    alpha = max_error / (n - 1 + K) ** aggressiveness
+    return n, alpha
