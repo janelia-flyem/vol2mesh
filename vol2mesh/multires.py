@@ -11,12 +11,12 @@ The format is documented in the neuroglancer source tree at
   concatenated Draco-encoded mesh fragments (one fragment per occupied
   grid cell, in Z-curve order).
 
-This module implements the *unsharded* storage representation and is
-currently aimed at the single-level-of-detail (single-LOD) case, which is
-the common case when each object's mesh is assembled from independently
-generated chunk meshes (one mesh per grid cell).  Multi-LOD output (octree
-decomposition with the 2x2x2 partition requirement) is not implemented
-here yet.
+This module implements the *unsharded* storage representation, for objects
+whose fragments are assembled from independently generated chunk meshes
+(one mesh per grid cell), with one or more levels of detail (see
+:func:`encode_multilod_object`).  It can also parse existing objects
+(:func:`parse_manifest`, :func:`decode_fragment`), e.g. to reuse their
+fragments when an object is updated.
 
 Coordinate spaces
 -----------------
@@ -779,6 +779,103 @@ def write_object_mesh(output_dir, segment_id, fragments,
     return num_fragments
 
 
+def parse_manifest(index_bytes):
+    """
+    Parse a single object's ``.index`` manifest.
+
+    Returns a dict with the manifest's header fields
+    (``chunk_shape_xyz``, ``grid_origin_xyz``, ``num_lods``, ``lod_scales``,
+    ``vertex_offsets``, ``num_fragments_per_lod``), plus ``"lods"``: a list
+    (one entry per LOD) of dicts with:
+
+        - ``"positions"``: (N, 3) int64 grid-cell positions, XYZ.
+        - ``"sizes"``: (N,) int64 byte size of each fragment (0 for placeholders).
+        - ``"offsets"``: (N,) int64 byte offset of each fragment within the data file.
+    """
+    buf = index_bytes
+    pos = 0
+
+    def take(dtype, count):
+        nonlocal pos
+        arr = np.frombuffer(buf, dtype=dtype, count=count, offset=pos)
+        pos += arr.nbytes
+        return arr
+
+    chunk_shape = take("<f4", 3).astype(np.float64)
+    grid_origin = take("<f4", 3).astype(np.float64)
+    num_lods = int(take("<u4", 1)[0])
+    lod_scales = take("<f4", num_lods).astype(np.float64)
+    vertex_offsets = take("<f4", num_lods * 3).astype(np.float64).reshape(num_lods, 3)
+    num_fragments_per_lod = take("<u4", num_lods).astype(np.int64)
+
+    lods = []
+    data_pos = 0
+    for lod in range(num_lods):
+        n = int(num_fragments_per_lod[lod])
+        # fragment_positions: C-order [3, n] => reshape then transpose back to (n, 3).
+        positions = take("<u4", n * 3).reshape(3, n).T.astype(np.int64)
+        sizes = take("<u4", n).astype(np.int64)
+        offsets = data_pos + np.concatenate(([0], np.cumsum(sizes)[:-1])).astype(np.int64)
+        data_pos += int(sizes.sum())
+        lods.append({"positions": positions, "sizes": sizes, "offsets": offsets[:n]})
+
+    if pos != len(buf):
+        raise ValueError(f"Manifest has {len(buf) - pos} unexpected trailing bytes")
+
+    return {
+        "chunk_shape_xyz": chunk_shape,
+        "grid_origin_xyz": grid_origin,
+        "num_lods": num_lods,
+        "lod_scales": lod_scales,
+        "vertex_offsets": vertex_offsets,
+        "num_fragments_per_lod": num_fragments_per_lod,
+        "lods": lods,
+    }
+
+
+def partition_fragment_by_cells(vertices_xyz, faces, cell_size_xyz, grid_origin_xyz=(0, 0, 0)):
+    """
+    Partition a fragment's triangles among the grid cells containing their centroids.
+
+    This is useful for recovering the pieces of a fragment which was assembled by
+    concatenating pieces that were each trimmed to a (finer) grid cell, e.g. an
+    LOD-k fragment assembled from per-chunk pieces, each trimmed to its LOD-0 cell.
+    (Each piece's triangles lie within its cell, so their centroids do, too.)
+
+    Args:
+        vertices_xyz:
+            (N, 3) vertex array, XYZ order.
+        faces:
+            (M, 3) integer face array.
+        cell_size_xyz:
+            (3,) extents of the grid's cells, XYZ order.
+        grid_origin_xyz:
+            (3,) origin of the grid, XYZ order.
+
+    Returns:
+        ``{(x, y, z): (vertices_xyz, faces)}`` keyed by integer grid-cell index,
+        where each entry's vertices are only those its faces use.
+    """
+    v = np.asarray(vertices_xyz, dtype=np.float64)
+    f = np.asarray(faces, dtype=np.int64)
+    if len(f) == 0:
+        return {}
+
+    centroids = (v[f[:, 0]] + v[f[:, 1]] + v[f[:, 2]]) / 3
+    cells = np.floor((centroids - np.asarray(grid_origin_xyz)) / np.asarray(cell_size_xyz)).astype(np.int64)
+
+    order = np.lexsort(cells.T[::-1])
+    cells = cells[order]
+    f = f[order]
+    starts = np.r_[0, 1 + np.flatnonzero((cells[1:] != cells[:-1]).any(axis=1)), len(cells)]
+
+    pieces = {}
+    for s, e in zip(starts[:-1], starts[1:]):
+        used, inverse = np.unique(f[s:e], return_inverse=True)
+        pieces[tuple(int(c) for c in cells[s])] = (v[used], inverse.reshape(-1, 3).astype(np.uint32))
+    return pieces
+
+
 def read_object_mesh(output_dir, segment_id, vertex_quantization_bits=None):
     """
     Parse a single object's ``.index`` manifest and data file and decode its
@@ -809,54 +906,23 @@ def read_object_mesh(output_dir, segment_id, vertex_quantization_bits=None):
     data_path = f"{output_dir}/{int(segment_id)}"
 
     with open(index_path, "rb") as f:
-        buf = f.read()
+        manifest = parse_manifest(f.read())
 
-    pos = 0
-
-    def take(dtype, count):
-        nonlocal pos
-        arr = np.frombuffer(buf, dtype=dtype, count=count, offset=pos)
-        pos += arr.nbytes
-        return arr
-
-    chunk_shape = take("<f4", 3).astype(np.float64)
-    grid_origin = take("<f4", 3).astype(np.float64)
-    num_lods = int(take("<u4", 1)[0])
-    lod_scales = take("<f4", num_lods).astype(np.float64)
-    vertex_offsets = take("<f4", num_lods * 3).astype(np.float64).reshape(num_lods, 3)
-    num_fragments_per_lod = take("<u4", num_lods).astype(np.int64)
-
-    result = {
-        "chunk_shape_xyz": chunk_shape,
-        "grid_origin_xyz": grid_origin,
-        "num_lods": num_lods,
-        "lod_scales": lod_scales,
-        "vertex_offsets": vertex_offsets,
-        "num_fragments_per_lod": num_fragments_per_lod,
-        "fragments": [],
-    }
+    result = {k: v for k, v in manifest.items() if k != "lods"}
+    result["fragments"] = []
 
     with open(data_path, "rb") as f:
         data = f.read()
 
-    data_pos = 0
-    for lod in range(num_lods):
-        n = int(num_fragments_per_lod[lod])
-        # fragment_positions: C-order [3, n] => reshape then transpose back to (n, 3).
-        frag_positions = take("<u4", n * 3).reshape(3, n).T.astype(np.int64)
-        frag_offsets = take("<u4", n).astype(np.int64)
-
-        for i in range(n):
-            size = int(frag_offsets[i])
-            chunk = data[data_pos:data_pos + size]
-            data_pos += size
+    for lod, frags in enumerate(manifest["lods"]):
+        for position, size, offset in zip(frags["positions"], frags["sizes"], frags["offsets"]):
             if size == 0:
                 continue
-            position = frag_positions[i]
             vertices_xyz, faces = decode_fragment(
-                chunk, position, chunk_shape, grid_origin,
+                data[offset:offset + size], position,
+                manifest["chunk_shape_xyz"], manifest["grid_origin_xyz"],
                 lod=lod, vertex_quantization_bits=vertex_quantization_bits,
-                vertex_offset=vertex_offsets[lod])
+                vertex_offset=manifest["vertex_offsets"][lod])
             result["fragments"].append({
                 "position": position,
                 "lod": lod,
